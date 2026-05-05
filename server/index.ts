@@ -217,7 +217,13 @@ app.get(
       let startCmd: string | null = null;
       let isVite = false;
 
-      const bashLc = (script: string) => `bash -lc ${JSON.stringify(script)}`;
+      const shellSingleQuote = (value: string) => {
+        // Wrap in single quotes and escape embedded single quotes safely.
+        // e.g. abc'def -> 'abc'"'"'def'
+        return `'${value.replace(/'/g, `'"'"'`)}'`;
+      };
+
+      const bashLc = (script: string) => `bash -lc ${shellSingleQuote(script)}`;
 
       const parseNodeVersion = (v: string) => {
         const m = v.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/);
@@ -278,9 +284,9 @@ app.get(
           'export PATH="$dir/bin:$PATH"',
           'node -v',
           'npm -v >/dev/null 2>&1 || true',
-        ].join("; ");
+        ].join("\n");
 
-        return script + "; ";
+        return script + "\n";
       };
 
       if (customCommand) {
