@@ -389,44 +389,184 @@ app.get(
 
       // PHASE 4 — run + port detection
       status("running");
-      let previewSent = false;
+      let previewUrl: string | null = null;
       const portRegexes = [
-        // Capture port and optional base path (some apps serve under /static/ etc.)
-        /https?:\/\/(?:localhost|0\.0\.0\.0|127\.0\.0\.1):(\d{2,5})(\/\S*)?/i,
-        /Local:\s+https?:\/\/[^:\s]+:(\d{2,5})(\/\S*)?/i,
         /(?:listening|running|server started|ready|started server).{0,40}?(?:port|:)\s*(\d{2,5})/i,
         /Uvicorn running on https?:\/\/[^:]+:(\d{2,5})/i,
         /You can now view .* in your browser.{0,80}?:(\d{2,5})/i,
       ];
+
+      const stripAnsi = (text: string) =>
+        text.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "");
+
       const normalizeBasePath = (p?: string) => {
         if (!p) return "";
         // Keep only a path part, no spaces. Ensure leading slash.
-        const path = p.trim();
+        const path = stripAnsi(p).trim();
         if (!path) return "";
         if (!path.startsWith("/")) return "/" + path;
         return path;
       };
 
-      const sendPreview = (port: number, basePath?: string) => {
-        if (previewSent || closed) return;
-        if (port < 1 || port > 65535) return;
+      const buildPreviewUrl = (port: number, basePath?: string) => {
+        if (port < 1 || port > 65535) return null;
         const host = sbx.getHost(port); // SYNC
         const path = normalizeBasePath(basePath);
-        send("preview", { url: `https://${host}${path}` });
-        previewSent = true;
+        return `https://${host}${path}`;
+      };
+
+      const sendPreviewUrl = (url: string, opts?: { force?: boolean }) => {
+        if (closed) return;
+        if (!opts?.force && previewUrl) return;
+        if (previewUrl === url) return;
+        previewUrl = url;
+        send("preview", { url });
+        send("log", { stream: "status", line: `→ Preview: ${url}` });
+      };
+
+      const extractUrlFromLine = (line: string): { port: number; basePath: string } | null => {
+        const clean = stripAnsi(line);
+        const matches = clean.match(/https?:\/\/[^\s]+/g);
+        if (!matches) return null;
+
+        for (const raw of matches) {
+          // Trim common trailing punctuation.
+          const candidate = raw.replace(/[),.;]+$/, "");
+          try {
+            const u = new URL(candidate);
+            const p = Number(u.port);
+            if (!p || Number.isNaN(p)) continue;
+            // Only treat local-ish URLs as port announcements.
+            if (!/^(localhost|0\.0\.0\.0|127\.0\.0\.1|\[::1\]|169\.254\.)/.test(u.hostname)) continue;
+            return { port: p, basePath: u.pathname || "" };
+          } catch {
+            // ignore
+          }
+        }
+        return null;
+      };
+
+      const ensureHostRewriteProxy = async (targetPort: number, basePath?: string) => {
+        if (!isVite) return;
+
+        const targetHost = sbx.getHost(targetPort);
+        const path = normalizeBasePath(basePath);
+
+        // Simulate the external request's Host header. If Vite blocks it,
+        // we run a tiny reverse-proxy on another port that rewrites Host
+        // to localhost:<targetPort> and forwards WebSocket upgrades.
+        const checkScript = [
+          "set -e",
+          `curl -fsSI -H ${JSON.stringify(`Host: ${targetHost}`)} ${JSON.stringify(`http://127.0.0.1:${targetPort}${path || "/"}`)} | head -n 1 || true`,
+        ].join("\n");
+        const check = await sbx.commands.run(bashLc(checkScript));
+        const first = stripAnsi(check.stdout).trim();
+        const isForbidden = /\s403\s/.test(first);
+        if (!isForbidden) return;
+
+        send("log", {
+          stream: "status",
+          line: "→ Vite appears to be blocking the E2B host header; starting an in-sandbox proxy…",
+        });
+
+        const proxyPorts = [3000, 4173, 8080];
+        const choosePortScript = [
+          "set -e",
+          `for p in ${proxyPorts.join(" ")}; do (echo > /dev/tcp/127.0.0.1/$p) >/dev/null 2>&1 || { echo $p; exit 0; }; done; exit 1`,
+        ].join("; ");
+        const choose = await sbx.commands.run(`bash -lc ${JSON.stringify(choosePortScript)}`);
+        const listenPort = parseInt(choose.stdout.trim(), 10);
+        if (Number.isNaN(listenPort)) return;
+
+        const proxyPath = "/home/user/.reporunner";
+        const proxyFile = `${proxyPath}/host-rewrite-proxy.cjs`;
+
+        const writeProxy = [
+          "set -e",
+          `mkdir -p ${JSON.stringify(proxyPath)}`,
+          `cat > ${JSON.stringify(proxyFile)} <<'EOF'`,
+          "const http = require('http');",
+          "const net = require('net');",
+          "const targetPort = Number(process.env.TARGET_PORT);",
+          "const listenPort = Number(process.env.LISTEN_PORT);",
+          "const targetHost = '127.0.0.1';",
+          "const rewriteHost = `localhost:${targetPort}`;",
+          "",
+          "const server = http.createServer((req, res) => {",
+          "  const headers = { ...req.headers, host: rewriteHost };",
+          "  const proxyReq = http.request({ hostname: targetHost, port: targetPort, method: req.method, path: req.url, headers }, (proxyRes) => {",
+          "    res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);",
+          "    proxyRes.pipe(res);",
+          "  });",
+          "  proxyReq.on('error', (err) => {",
+          "    res.statusCode = 502;",
+          "    res.setHeader('content-type', 'text/plain');",
+          "    res.end(String(err && err.message ? err.message : err));",
+          "  });",
+          "  req.pipe(proxyReq);",
+          "});",
+          "",
+          "server.on('upgrade', (req, socket, head) => {",
+          "  const upstream = net.connect(targetPort, targetHost);",
+          "  upstream.on('connect', () => {",
+          "    const headers = { ...req.headers, host: rewriteHost };",
+          "    let headerLines = '';",
+          "    for (const [k, v] of Object.entries(headers)) {",
+          "      if (typeof v === 'undefined') continue;",
+          "      if (Array.isArray(v)) headerLines += `${k}: ${v.join(', ')}\\r\\n`;",
+          "      else headerLines += `${k}: ${v}\\r\\n`;",
+          "    }",
+          "    upstream.write(`${req.method} ${req.url} HTTP/${req.httpVersion}\\r\\n${headerLines}\\r\\n`);",
+          "    if (head && head.length) upstream.write(head);",
+          "    socket.pipe(upstream).pipe(socket);",
+          "  });",
+          "  upstream.on('error', () => socket.destroy());",
+          "});",
+          "",
+          "server.listen(listenPort, '0.0.0.0', () => {",
+          "  console.log(`[proxy] listening on :${listenPort} -> :${targetPort}`);",
+          "});",
+          "EOF",
+        ].join("\n");
+        await sbx.commands.run(bashLc(writeProxy));
+
+        await sbx.commands.run(bashLc(`node ${JSON.stringify(proxyFile)}`), {
+          background: true,
+          envs: {
+            TARGET_PORT: String(targetPort),
+            LISTEN_PORT: String(listenPort),
+          },
+        });
+
+        const fixedUrl = buildPreviewUrl(listenPort, path);
+        if (fixedUrl) {
+          sendPreviewUrl(fixedUrl, { force: true });
+        }
+      };
+
+      const sendPreview = (port: number, basePath?: string) => {
+        const url = buildPreviewUrl(port, basePath);
+        if (!url) return;
+        sendPreviewUrl(url);
+        void ensureHostRewriteProxy(port, basePath);
       };
       const handleLine = (
         stream: "stdout" | "stderr",
         data: string,
       ) => {
         send("log", { stream, line: data });
-        if (previewSent) return;
+        if (previewUrl) return;
+
+        const u = extractUrlFromLine(data);
+        if (u) {
+          sendPreview(u.port, u.basePath);
+          return;
+        }
         for (const rx of portRegexes) {
           const m = data.match(rx);
           if (m) {
             const port = parseInt(m[1], 10);
-            const basePath = m.length >= 3 ? m[2] : undefined;
-            sendPreview(port, basePath);
+            sendPreview(port);
             break;
           }
         }
@@ -452,7 +592,7 @@ app.get(
       // serve on non-standard ports (e.g. 5000), so probe a small set of
       // common ports and pick the first open one.
       setTimeout(() => {
-        if (previewSent || closed) return;
+        if (previewUrl || closed) return;
         void (async () => {
           const candidates = isVite
             ? [5173, 3000, 5000, 8000, 8080]
