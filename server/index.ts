@@ -233,7 +233,8 @@ app.get(
       const ensureModernNodePrefix = async (): Promise<string> => {
         // Vite requires Node >= 20.12 or >= 22.12. Some E2B base images ship 20.9.
         const required = { major: 20, minor: 12 };
-        const desiredNode = "22.12.0";
+        // Many modern repos also require Node >= 24 via package.json engines.
+        const desiredNode = "24.14.0";
 
         const v = await sbx.commands.run(bashLc("node -v 2>/dev/null || true"));
         const parsed = parseNodeVersion(v.stdout);
@@ -393,13 +394,34 @@ app.get(
       });
 
       // Fallback: if no port detected from logs after 30s, optimistically
-      // expose the most likely port for the detected stack. The iframe
-      // will load whichever port is actually serving (or show a 502 if
-      // nothing is — at least the user will see *something*).
+      // expose the most likely port for the detected stack. Some repos
+      // serve on non-standard ports (e.g. 5000), so probe a small set of
+      // common ports and pick the first open one.
       setTimeout(() => {
         if (previewSent || closed) return;
-        const fallbackPort = isVite ? 5173 : 3000;
-        sendPreview(fallbackPort);
+        void (async () => {
+          const candidates = isVite
+            ? [5173, 3000, 5000, 8000, 8080]
+            : [3000, 5000, 5173, 8000, 8080];
+          const script = [
+            "set -e",
+            `for p in ${candidates.join(" ")}; do (echo > /dev/tcp/127.0.0.1/$p) >/dev/null 2>&1 && echo $p && exit 0; done; exit 1`,
+          ].join("; ");
+
+          try {
+            const r = await sbx.commands.run(`bash -lc ${JSON.stringify(script)}`);
+            const found = parseInt(r.stdout.trim(), 10);
+            if (!Number.isNaN(found)) {
+              sendPreview(found);
+              return;
+            }
+          } catch {
+            // ignore probe failures; fall back below
+          }
+
+          const fallbackPort = isVite ? 5173 : 3000;
+          sendPreview(fallbackPort);
+        })();
       }, PREVIEW_FALLBACK_MS);
     } catch (err: any) {
       errorAndEnd(err?.message ?? "Unknown error during execution");
