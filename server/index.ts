@@ -217,9 +217,49 @@ app.get(
       let startCmd: string | null = null;
       let isVite = false;
 
+      const bashLc = (script: string) => `bash -lc ${JSON.stringify(script)}`;
+
+      const parseNodeVersion = (v: string) => {
+        const m = v.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/);
+        if (!m) return null;
+        return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
+      };
+
+      const isNodeAtLeast = (v: { major: number; minor: number; patch: number }, reqMajor: number, reqMinor: number) => {
+        if (v.major !== reqMajor) return v.major > reqMajor;
+        return v.minor >= reqMinor;
+      };
+
+      const ensureModernNodePrefix = async (): Promise<string> => {
+        // Vite requires Node >= 20.12 or >= 22.12. Some E2B base images ship 20.9.
+        const required = { major: 20, minor: 12 };
+        const desiredNode = "22.12.0";
+
+        const v = await sbx.commands.run(bashLc("node -v 2>/dev/null || true"));
+        const parsed = parseNodeVersion(v.stdout);
+        if (parsed && isNodeAtLeast(parsed, required.major, required.minor)) {
+          return "";
+        }
+
+        send("log", {
+          stream: "status",
+          line: `→ Upgrading Node in sandbox (found ${v.stdout.trim() || "unknown"}, need >=${required.major}.${required.minor})`,
+        });
+
+        // Install nvm (user-space) and use a compatible Node version.
+        return [
+          'export NVM_DIR="$HOME/.nvm"',
+          'if [ ! -s "$NVM_DIR/nvm.sh" ]; then curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash; fi',
+          '. "$NVM_DIR/nvm.sh"',
+          `nvm install ${desiredNode} >/dev/null`,
+          `nvm use ${desiredNode} >/dev/null`,
+        ].join("; ") + "; ";
+      };
+
       if (customCommand) {
         startCmd = customCommand;
       } else if (await has("package.json")) {
+        const nodePrefix = await ensureModernNodePrefix();
         installCmd = "npm install --no-audit --no-fund --loglevel=error";
         const pkgText = await sbx.files.read("/home/user/repo/package.json");
         let pkg: any = {};
@@ -244,6 +284,12 @@ app.get(
           startCmd = "npm run serve" + viteSuffix;
         } else {
           return errorAndEnd("package.json has no dev/start/serve script");
+        }
+
+        // Ensure both install + start run under the modern Node if we upgraded.
+        if (nodePrefix) {
+          installCmd = bashLc(nodePrefix + installCmd);
+          startCmd = bashLc(nodePrefix + startCmd);
         }
       } else if (await has("requirements.txt")) {
         installCmd = "pip install -r requirements.txt";
