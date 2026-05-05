@@ -415,6 +415,50 @@ app.get(
         return `https://${host}${path}`;
       };
 
+      let previewDiagnosed = false;
+      const runPreviewDiagnostics = (port: number, basePath?: string) => {
+        if (previewDiagnosed || closed) return;
+        previewDiagnosed = true;
+
+        const path = normalizeBasePath(basePath) || "/";
+        const safePath = path.startsWith("/") ? path : `/${path}`;
+        const target = `http://127.0.0.1:${port}${safePath}`;
+
+        void (async () => {
+          try {
+            send("log", {
+              stream: "status",
+              line: `→ Preview diagnostics: probing ${target}`,
+            });
+
+            const script = [
+              "set -e",
+              "command -v curl >/dev/null 2>&1 || { echo 'curl not available'; exit 0; }",
+              `echo '--- status+headers ---'`,
+              `curl -sS -L -D - -o /dev/null --max-time 5 ${JSON.stringify(target)} | sed -n '1,40p'`,
+              `echo '--- key headers ---'`,
+              `curl -sS -L -D - -o /dev/null --max-time 5 ${JSON.stringify(target)} | awk 'BEGIN{IGNORECASE=1} /^(x-frame-options|content-security-policy|cross-origin-opener-policy|cross-origin-embedder-policy|cross-origin-resource-policy|x-content-type-options|location|content-type):/ {print}'`,
+              `echo '--- body head (first 400 bytes) ---'`,
+              `curl -sS -L --max-time 5 ${JSON.stringify(target)} | head -c 400 | tr '\n' ' '`,
+              `echo`,
+            ].join("\n");
+
+            const out = await sbx.commands.run(bashLc(script));
+            const text = stripAnsi(out.stdout || "").trim();
+            if (text) {
+              for (const line of text.split(/\r?\n/)) {
+                send("log", { stream: "status", line: `→ ${line}` });
+              }
+            }
+          } catch (e: any) {
+            send("log", {
+              stream: "status",
+              line: `→ Preview diagnostics failed: ${e?.message ?? e}`,
+            });
+          }
+        })();
+      };
+
       const sendPreviewUrl = (url: string, opts?: { force?: boolean }) => {
         if (closed) return;
         if (!opts?.force && previewUrl) return;
@@ -548,6 +592,7 @@ app.get(
         const url = buildPreviewUrl(port, basePath);
         if (!url) return;
         sendPreviewUrl(url);
+        runPreviewDiagnostics(port, basePath);
         void ensureHostRewriteProxy(port, basePath);
       };
       const handleLine = (
