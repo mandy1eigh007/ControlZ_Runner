@@ -15,6 +15,27 @@ app.use(express.json());
 const sandboxes = new Map<string, Sandbox>();
 const sandboxTimers = new Map<string, NodeJS.Timeout>();
 
+function getNormalizedE2BApiKey(): { ok: true; value: string } | { ok: false; reason: string } {
+  const raw = process.env.E2B_API_KEY;
+  if (!raw) return { ok: false, reason: "missing" };
+
+  // Common copy/paste issues that break the Authorization header:
+  // - trailing newline(s)
+  // - surrounding quotes
+  // - leading/trailing whitespace
+  let value = raw.replace(/\r?\n/g, "").trim();
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1).trim();
+  }
+
+  if (!value) return { ok: false, reason: "empty" };
+  if (/\s/.test(value)) {
+    // Still contains whitespace (space/tab/etc.) after normalization.
+    return { ok: false, reason: "contains-whitespace" };
+  }
+  return { ok: true, value };
+}
+
 function isValidGitHubUrl(url: string): boolean {
   return /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?\/?$/.test(url);
 }
@@ -50,11 +71,16 @@ app.post("/api/run", async (req: Request, res: Response) => {
     if (!url || !isValidGitHubUrl(url)) {
       return res.status(400).json({ error: "Invalid GitHub URL" });
     }
-    if (!process.env.E2B_API_KEY) {
-      return res.status(500).json({ error: "Server missing E2B_API_KEY" });
+    const key = getNormalizedE2BApiKey();
+    if (!key.ok) {
+      const hint =
+        key.reason === "missing" ? "Set E2B_API_KEY in .env and restart the backend."
+        : key.reason === "contains-whitespace" ? "Remove quotes/whitespace/newlines from E2B_API_KEY in .env and restart."
+        : "Check E2B_API_KEY in .env and restart.";
+      return res.status(500).json({ error: `Server missing/invalid E2B_API_KEY (${key.reason}). ${hint}` });
     }
     const sbx = await Sandbox.create({
-      apiKey: process.env.E2B_API_KEY,
+      apiKey: key.value,
       timeoutMs: SANDBOX_TIMEOUT_MS,
     });
     sandboxes.set(sbx.sandboxId, sbx);
@@ -147,6 +173,46 @@ app.get(
         return r.stdout.trim() === "yes";
       };
 
+      const repoHasAny = async (findExpr: string) => {
+        const r = await sbx.commands.run(
+          `sh -lc ${JSON.stringify(
+            `find /home/user/repo -maxdepth 4 -type f ${findExpr} -print -quit`,
+          )}`,
+        );
+        return r.stdout.trim().length > 0;
+      };
+
+      const looksDocsOnly = async () => {
+        const hasDocs =
+          (await has("README.md")) ||
+          (await repoHasAny("\\( -iname 'readme*' -o -name '*.md' \\)"));
+        if (!hasDocs) return false;
+
+        const hasCode = await repoHasAny(
+          "\\( " +
+            [
+              "-name '*.ts'",
+              "-name '*.tsx'",
+              "-name '*.js'",
+              "-name '*.jsx'",
+              "-name '*.mjs'",
+              "-name '*.cjs'",
+              "-name '*.py'",
+              "-name '*.go'",
+              "-name '*.rs'",
+              "-name '*.java'",
+              "-name '*.cs'",
+              "-name '*.php'",
+              "-name '*.rb'",
+              "-name '*.sh'",
+              "-name '*.ps1'",
+            ].join(" -o ") +
+            " \\)",
+        );
+
+        return !hasCode;
+      };
+
       let installCmd: string | null = null;
       let startCmd: string | null = null;
       let isVite = false;
@@ -208,9 +274,13 @@ app.get(
       } else if ((await has("index.html")) && !(await has("package.json"))) {
         startCmd = "python3 -m http.server 3000 --bind 0.0.0.0";
       } else {
-        return errorAndEnd(
-          "Could not detect how to run this repo. Use Advanced to provide a custom start command.",
-        );
+        if (await looksDocsOnly()) {
+          startCmd = "python3 -m http.server 3000 --bind 0.0.0.0";
+        } else {
+          return errorAndEnd(
+            "Could not detect how to run this repo. Use Advanced to provide a custom start command.",
+          );
+        }
       }
 
       send("log", { stream: "status", line: `→ Will run: ${startCmd}` });
