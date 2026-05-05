@@ -225,42 +225,67 @@ app.get(
         return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]) };
       };
 
-      const isNodeAtLeast = (v: { major: number; minor: number; patch: number }, reqMajor: number, reqMinor: number) => {
-        if (v.major !== reqMajor) return v.major > reqMajor;
-        return v.minor >= reqMinor;
+      const isViteCompatibleNode = (v: { major: number; minor: number; patch: number }) => {
+        // Vite currently requires Node >= 20.19 or >= 22.12.
+        if (v.major > 22) return true;
+        if (v.major === 22) return v.minor >= 12;
+        if (v.major === 20) return v.minor >= 19;
+        return false;
       };
 
-      const ensureModernNodePrefix = async (): Promise<string> => {
-        // Vite requires Node >= 20.12 or >= 22.12. Some E2B base images ship 20.9.
-        const required = { major: 20, minor: 12 };
-        // Many modern repos also require Node >= 24 via package.json engines.
+      const parseEnginesNodeMajor = (enginesNode: unknown): number | null => {
+        if (typeof enginesNode !== "string") return null;
+        // Very small heuristic: grab the first major in a ">=24" or "24.x" style range.
+        const m = enginesNode.match(/(\d{2})(?:\.|\s|$)/);
+        return m ? Number(m[1]) : null;
+      };
+
+      const ensureModernNodePrefix = async (reason: string): Promise<string> => {
+        // Avoid nvm in the sandbox (often not persisted / not sourced). Instead,
+        // download a prebuilt Node tarball and prepend it to PATH.
         const desiredNode = "24.14.0";
 
         const v = await sbx.commands.run(bashLc("node -v 2>/dev/null || true"));
         const parsed = parseNodeVersion(v.stdout);
-        if (parsed && isNodeAtLeast(parsed, required.major, required.minor)) {
+        if (parsed && isViteCompatibleNode(parsed)) {
           return "";
         }
 
         send("log", {
           stream: "status",
-          line: `→ Upgrading Node in sandbox (found ${v.stdout.trim() || "unknown"}, need >=${required.major}.${required.minor})`,
+          line: `→ Upgrading Node in sandbox (${reason}; found ${v.stdout.trim() || "unknown"})`,
         });
 
-        // Install nvm (user-space) and use a compatible Node version.
-        return [
-          'export NVM_DIR="$HOME/.nvm"',
-          'if [ ! -s "$NVM_DIR/nvm.sh" ]; then curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash; fi',
-          '. "$NVM_DIR/nvm.sh"',
-          `nvm install ${desiredNode} >/dev/null`,
-          `nvm use ${desiredNode} >/dev/null`,
-        ].join("; ") + "; ";
+        const script = [
+          "set -e",
+          'export HOME="${HOME:-/home/user}"',
+          `ver="${desiredNode}"`,
+          'arch="$(uname -m)"',
+          'case "$arch" in x86_64|amd64) nodeArch="x64" ;; aarch64|arm64) nodeArch="arm64" ;; *) echo "Unsupported arch: $arch" 1>&2; exit 1 ;; esac',
+          'cache="$HOME/.cache"',
+          'dir="$cache/node-v'$"{ver}"'$"-linux-$nodeArch"',
+          'if [ ! -x "$dir/bin/node" ]; then',
+          '  mkdir -p "$cache"',
+          '  tmp="$(mktemp -d)"',
+          '  url="https://nodejs.org/dist/v'$"{ver}"'$"/node-v'$"{ver}"'$"-linux-$nodeArch.tar.xz"',
+          '  echo "Downloading $url"',
+          '  curl -fsSL "$url" -o "$tmp/node.tar.xz"',
+          '  tar -xJf "$tmp/node.tar.xz" -C "$tmp"',
+          '  rm -rf "$dir"',
+          '  mv "$tmp/node-v'$"{ver}"'$"-linux-$nodeArch" "$dir"',
+          '  rm -rf "$tmp"',
+          'fi',
+          'export PATH="$dir/bin:$PATH"',
+          'node -v',
+          'npm -v >/dev/null 2>&1 || true',
+        ].join("; ");
+
+        return script + "; ";
       };
 
       if (customCommand) {
         startCmd = customCommand;
       } else if (await has("package.json")) {
-        const nodePrefix = await ensureModernNodePrefix();
         installCmd = "npm install --no-audit --no-fund --loglevel=error";
         const pkgText = await sbx.files.read("/home/user/repo/package.json");
         let pkg: any = {};
@@ -273,6 +298,16 @@ app.get(
           ...(pkg.devDependencies || {}),
         };
         isVite = "vite" in allDeps;
+
+        const enginesMajor = parseEnginesNodeMajor(pkg?.engines?.node);
+        const needsModernNode = isVite || (typeof enginesMajor === "number" && enginesMajor >= 24);
+        const nodePrefix = needsModernNode
+          ? await ensureModernNodePrefix(
+              isVite
+                ? "Vite requires newer Node"
+                : `package.json engines.node suggests >=${enginesMajor}`,
+            )
+          : "";
 
         // For Vite, append --host 0.0.0.0 so it binds to all interfaces.
         // For other Node frameworks, HOST=0.0.0.0 env var handles it.
