@@ -391,17 +391,28 @@ app.get(
       status("running");
       let previewSent = false;
       const portRegexes = [
-        /https?:\/\/(?:localhost|0\.0\.0\.0|127\.0\.0\.1):(\d{2,5})/i,
-        /Local:\s+https?:\/\/[^:\s]+:(\d{2,5})/i,
+        // Capture port and optional base path (some apps serve under /static/ etc.)
+        /https?:\/\/(?:localhost|0\.0\.0\.0|127\.0\.0\.1):(\d{2,5})(\/\S*)?/i,
+        /Local:\s+https?:\/\/[^:\s]+:(\d{2,5})(\/\S*)?/i,
         /(?:listening|running|server started|ready|started server).{0,40}?(?:port|:)\s*(\d{2,5})/i,
         /Uvicorn running on https?:\/\/[^:]+:(\d{2,5})/i,
         /You can now view .* in your browser.{0,80}?:(\d{2,5})/i,
       ];
-      const sendPreview = (port: number) => {
+      const normalizeBasePath = (p?: string) => {
+        if (!p) return "";
+        // Keep only a path part, no spaces. Ensure leading slash.
+        const path = p.trim();
+        if (!path) return "";
+        if (!path.startsWith("/")) return "/" + path;
+        return path;
+      };
+
+      const sendPreview = (port: number, basePath?: string) => {
         if (previewSent || closed) return;
         if (port < 1 || port > 65535) return;
         const host = sbx.getHost(port); // SYNC
-        send("preview", { url: `https://${host}` });
+        const path = normalizeBasePath(basePath);
+        send("preview", { url: `https://${host}${path}` });
         previewSent = true;
       };
       const handleLine = (
@@ -413,7 +424,9 @@ app.get(
         for (const rx of portRegexes) {
           const m = data.match(rx);
           if (m) {
-            sendPreview(parseInt(m[1], 10));
+            const port = parseInt(m[1], 10);
+            const basePath = m.length >= 3 ? m[2] : undefined;
+            sendPreview(port, basePath);
             break;
           }
         }
