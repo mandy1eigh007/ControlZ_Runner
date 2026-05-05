@@ -5,5 +5,23 @@
 html, body, #root { height: 100%; }
 body { margin: 0; font-family: system-ui, -apple-system, sans-serif; }
 
+@layer base {
+	:root {
+		color-scheme: dark;
+	}
+
+	/* Keep selections visible without harsh neon. */
+	::selection {
+		background: rgb(6 95 70 / 0.55); /* emerald-700-ish */
+		color: rgb(236 253 245); /* emerald-50 */
+	}
+
+	/* Ensure focus is clearly visible for keyboard users. */
+	:focus-visible {
+		outline: 2px solid rgb(16 185 129 / 0.85); /* emerald-500 */
+		outline-offset: 2px;
+	}
+}
+
 .xterm { padding: 8px; height: 100%; }
 .xterm-viewport { background-color: transparent !important; }
