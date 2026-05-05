@@ -59,10 +59,70 @@ export function App() {
         brightWhite: "#ecfdf5",
       },
     });
+
+    const writeClipboard = async (text: string) => {
+      try {
+        await navigator.clipboard.writeText(text);
+        return;
+      } catch {
+        // Fallback for environments where Clipboard API is unavailable/blocked.
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("readonly", "true");
+        ta.style.position = "fixed";
+        ta.style.left = "-9999px";
+        ta.style.top = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        try {
+          document.execCommand("copy");
+        } finally {
+          document.body.removeChild(ta);
+        }
+      }
+    };
+
+    const copySelection = async () => {
+      const text = term.getSelection();
+      if (!text) return;
+      await writeClipboard(text);
+    };
+
+    term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
+      const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+      const mod = isMac ? ev.metaKey : ev.ctrlKey;
+      if (!mod) return true;
+      const key = ev.key.toLowerCase();
+
+      // Ctrl/Cmd+A: select all terminal output
+      if (key === "a") {
+        term.selectAll();
+        return false;
+      }
+
+      // Copy behavior:
+      // - Ctrl/Cmd+Shift+C always copies
+      // - Ctrl/Cmd+C copies when there is a selection
+      if (key === "c" && (ev.shiftKey || term.hasSelection())) {
+        void copySelection();
+        return false;
+      }
+
+      return true;
+    });
+
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(termRef.current);
     setTimeout(() => fit.fit(), 0);
+
+    // Right-click copy when there is a selection (keeps default context menu otherwise).
+    term.element?.addEventListener("contextmenu", (e) => {
+      if (!term.hasSelection()) return;
+      e.preventDefault();
+      void copySelection();
+    });
+
     terminalRef.current = term;
     fitRef.current = fit;
     const onResize = () => fit.fit();
