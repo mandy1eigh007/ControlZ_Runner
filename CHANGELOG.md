@@ -10,6 +10,19 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P1-6: pre-clone GitHub language detection
+
+Added `fetchRepoLanguages(owner, name)` that calls `GET /repos/:o/:r/languages`
+before the clone phase (5s timeout, honors optional `GITHUB_TOKEN` to dodge
+the 60/hr unauth limit). Top-3 languages are surfaced as a status log line
+(e.g. `→ GitHub languages: Python 84%, JavaScript 12%, CSS 4%`) and the full
+sorted list is stashed on the per-sandbox `RunConfig.githubLanguages` for use
+by later detection heuristics (P1-7) and the status pill (P2-10). Failure
+modes (network, 404, rate-limit, abort) all return `null` silently — never
+blocks the clone.
+
+---
+
 ## 2026-05-06 — P0-FIX-3 / P0-FIX-4: avoid CUDA OOM + active hybrid port poll
 
 LDR install OOM-killed the sandbox: `torch` from PyPI defaults pulled

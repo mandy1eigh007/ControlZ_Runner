@@ -37,6 +37,7 @@ type RunConfig = {
   customCommand: string;
   stack: Stack;
   envs: Record<string, string>;
+  githubLanguages?: Array<[string, number]> | null;
 };
 const runConfigs = new Map<string, RunConfig>();
 
@@ -96,6 +97,50 @@ function isValidGitHubUrl(url: string): boolean {
 
 function normalizeUrl(url: string): string {
   return url.replace(/\/$/, "").replace(/\.git$/, "");
+}
+
+// Extract {owner, name} from a normalized https://github.com/<owner>/<name> URL.
+// Returns null if it doesn't match (callers should already have called isValidGitHubUrl).
+function parseOwnerRepo(url: string): { owner: string; name: string } | null {
+  const m = /^https:\/\/github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(url);
+  if (!m) return null;
+  return { owner: m[1], name: m[2] };
+}
+
+// Pre-clone: query GitHub's languages API so we can hint the stack before we
+// pay the clone cost. Returns a sorted list of [lang, bytes] tuples (largest
+// first), or null on any failure (network/404/rate-limit). Never throws.
+// Honors GITHUB_TOKEN if set to dodge the 60/hr unauth limit.
+async function fetchRepoLanguages(
+  owner: string,
+  name: string,
+): Promise<Array<[string, number]> | null> {
+  try {
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "ControlZ-Runner",
+    };
+    const tok = process.env.GITHUB_TOKEN?.trim();
+    if (tok) headers.Authorization = `Bearer ${tok}`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5_000);
+    const r = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(name)}/languages`,
+      { headers, signal: ctrl.signal },
+    );
+    clearTimeout(timer);
+    if (!r.ok) return null;
+    const json = (await r.json()) as Record<string, number>;
+    if (!json || typeof json !== "object") return null;
+    const entries = Object.entries(json).filter(
+      ([, v]) => typeof v === "number" && v > 0,
+    );
+    entries.sort((a, b) => b[1] - a[1]);
+    return entries;
+  } catch {
+    return null;
+  }
 }
 
 // Centralized cleanup so we never double-kill or leak timers.
@@ -226,6 +271,34 @@ app.get(
       } catch {}
       void disposeSandbox(sandboxId);
     };
+
+    // Pre-clone: ask GitHub what languages this repo uses. Purely advisory —
+    // we surface it as a status hint and stash it on the run config so later
+    // detection / UI can use it (P2-10 status pill, P1-7 fallback heuristics).
+    // Never blocks the clone: a null result just means we skip the hint.
+    let githubLanguages: Array<[string, number]> | null = null;
+    {
+      const parsed = parseOwnerRepo(url);
+      if (parsed) {
+        githubLanguages = await fetchRepoLanguages(parsed.owner, parsed.name);
+        if (githubLanguages && githubLanguages.length > 0) {
+          const total = githubLanguages.reduce((a, [, b]) => a + b, 0) || 1;
+          const top = githubLanguages
+            .slice(0, 3)
+            .map(([lang, b]) => `${lang} ${Math.round((b / total) * 100)}%`)
+            .join(", ");
+          send("log", {
+            stream: "status",
+            line: `→ GitHub languages: ${top}`,
+          });
+        }
+      }
+    }
+    // Persist for downstream consumers (status pill, etc.).
+    {
+      const cfgRef = runConfigs.get(sandboxId);
+      if (cfgRef) cfgRef.githubLanguages = githubLanguages;
+    }
 
     try {
       // PHASE 1 — clone
