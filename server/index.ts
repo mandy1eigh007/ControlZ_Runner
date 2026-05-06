@@ -1505,7 +1505,14 @@ app.get(
       // Register the Vite port up-front so the UI can render a tab even
       // before the backend port is discovered.
       if (getHybridMode()) {
-        registerPreviewOption(5173, "/", "Vite");
+        // LDR and similar hybrids typically mount Vite under /static/.
+        // We seed the preview to Vite early so the user sees *something*
+        // while the Python backend warms up; the hybrid poller will rebind
+        // to the backend as soon as it starts responding.
+        registerPreviewOption(5173, "/static/", "Vite");
+        if (!previewUrl) {
+          sendPreview(5173, "/static/");
+        }
       }
 
       await sbx.commands.run(startCmd!, {

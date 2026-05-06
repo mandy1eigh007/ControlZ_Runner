@@ -34,6 +34,10 @@ targets instead of forcing a single iframe URL.
   click a non-primary tab it keeps your selection until you click the primary
   tab again.
 
+Hybrid runs now also seed the initial preview to Vite `:5173/static/` so the
+iframe isn’t blank while the Python backend is still booting; the existing
+hybrid poller continues to rebind to the backend as soon as it responds.
+
 ---
 
 ## 2026-05-06 — P2-12: quieter pip / npm install logs
