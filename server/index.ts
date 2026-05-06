@@ -1652,15 +1652,29 @@ app.get(
         // Probe in parallel within the sandbox and print the first port
         // that returns a non-empty body. Also report ports that are at least
         // listening (TCP open) as a hint while we wait for a body.
+        // Importantly: probe via the container's external link-local IP
+        // (e.g. 169.254.0.21) when we can resolve one — that's the address
+        // the e2b preview proxy connects to. A port bound to 127.0.0.1
+        // only will respond to the loopback probe but the iframe will 502.
         const pollScript = [
           "set -e",
           "command -v curl >/dev/null 2>&1 || exit 0",
-          // First pass: any port returning a body wins.
+          // Find the container's non-loopback IPv4 (best effort).
+          "ext=$(hostname -I 2>/dev/null | awk '{print $1}')",
+          '[ -z "$ext" ] && ext=127.0.0.1',
+          // First pass: try external IP. A body here means the e2b preview
+          // proxy will also be able to reach it.
           `for p in ${pyPorts.join(" ")}; do`,
-          "  body=$(curl -fsS --max-time 2 \"http://127.0.0.1:$p/\" 2>/dev/null | head -c 32 || true)",
+          "  body=$(curl -fsS --max-time 2 \"http://$ext:$p/\" 2>/dev/null | head -c 32 || true)",
           '  if [ -n "$body" ]; then echo "READY $p"; exit 0; fi',
           "done",
-          // Second pass: report any TCP-open ports so the user sees progress.
+          // Second pass: loopback only — port is bound but only on 127.0.0.1.
+          // Report as LOCAL_ONLY so we can warn the user.
+          `for p in ${pyPorts.join(" ")}; do`,
+          "  body=$(curl -fsS --max-time 2 \"http://127.0.0.1:$p/\" 2>/dev/null | head -c 32 || true)",
+          '  if [ -n "$body" ]; then echo "LOCAL_ONLY $p"; exit 0; fi',
+          "done",
+          // Third pass: any TCP-open ports for progress hint.
           "open=\"\"",
           `for p in ${pyPorts.join(" ")}; do`,
           "  (echo > /dev/tcp/127.0.0.1/$p) >/dev/null 2>&1 && open=\"$open $p\"",
@@ -1675,6 +1689,11 @@ app.get(
         const HEARTBEAT_MS = 15_000;
         let lastHeartbeat = 0;
         let lastOpenSig = "";
+        let firstTick = true;
+        send("log", {
+          stream: "status",
+          line: `→ Hybrid poller: watching ports [${pyPorts.join(",")}] for Python backend (will rebind preview when one responds).`,
+        });
         const tick = async () => {
           if (closed) return;
           const elapsed = Date.now() - start;
@@ -1702,16 +1721,35 @@ app.get(
               }
               return;
             }
-            // No READY yet; emit a heartbeat at most every HEARTBEAT_MS so
-            // the user can see we're still polling and which ports (if any)
-            // are at least TCP-open.
-            if (elapsed - lastHeartbeat >= HEARTBEAT_MS) {
+            // LOCAL_ONLY: a Python port is serving on 127.0.0.1 but not on
+            // the container's external IP. The e2b preview proxy can't
+            // reach it. Tell the user exactly what to do, then keep polling
+            // in case the app re-binds (some apps log "running on" before
+            // actually starting the server).
+            const localMatch = out.match(/^LOCAL_ONLY\s+(\d+)/m);
+            if (localMatch) {
+              const lp = Number(localMatch[1]);
+              if (firstTick || elapsed - lastHeartbeat >= HEARTBEAT_MS) {
+                firstTick = false;
+                lastHeartbeat = elapsed;
+                send("log", {
+                  stream: "status",
+                  line: `→ Hybrid poller: Python backend listening on 127.0.0.1:${lp} but NOT on the container's external IP — the iframe preview cannot reach it. Set HOST=0.0.0.0 (and an app-specific equivalent like LDR_HOST=0.0.0.0 / FLASK_RUN_HOST=0.0.0.0) in Advanced > Environment variables, then re-run.`,
+                });
+              }
+              setTimeout(() => void tick(), POLL_INTERVAL_MS);
+              return;
+            }
+            // No READY yet; emit a heartbeat on the first probe (so the
+            // user has visible proof the poller is alive) and then at most
+            // every HEARTBEAT_MS afterwards.
+            if (firstTick || elapsed - lastHeartbeat >= HEARTBEAT_MS) {
+              firstTick = false;
               lastHeartbeat = elapsed;
               const openMatch = out.match(/^OPEN\s+(.+)$/m);
               const openPorts = openMatch ? openMatch[1].trim().split(/\s+/).join(",") : "";
               const openSig = openPorts;
-              // Only log when content changed OR every 30s anyway.
-              if (openSig !== lastOpenSig || elapsed % 30_000 < HEARTBEAT_MS) {
+              if (openSig !== lastOpenSig || elapsed >= HEARTBEAT_MS) {
                 lastOpenSig = openSig;
                 const detail = openPorts
                   ? `ports listening but not ready: [${openPorts}]`

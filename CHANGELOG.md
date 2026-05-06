@@ -15,6 +15,9 @@ _(planned — see todo list)_
 Hybrid runs (Python backend + Vite asset server) sometimes left the user
 staring at a blank `:5173` preview for 30-90s with **zero log output** while
 Flask finished booting. From the user's POV it looked like a hang.
+Worse, when Flask did bind it often bound to `127.0.0.1` only — invisible
+to the e2b preview proxy — and the runner had no way to detect or surface
+this.
 
 **Changes — [server/index.ts](server/index.ts):**
 
@@ -22,11 +25,16 @@ Flask finished booting. From the user's POV it looked like a hang.
   `[5000,8000,8080,3000]` → `[5000,5001,5050,8000,8080,3000,4000,7860,8501,8888]`
   (now covers Flask alt port, Gradio, Streamlit, Jupyter, common dev ports).
 - First probe moved from 10s → 4s; interval 5s → 4s.
-- Poll script now also checks which ports are TCP-open (not yet serving)
-  via `/dev/tcp/127.0.0.1/$p`, so we can show meaningful progress.
-- Heartbeat status line every ~15s while waiting:
-  `→ Hybrid poller: still waiting for Python backend (Ns elapsed; ports
-  listening but not ready: [5000])`. Avoids the "did it crash?" feeling.
+- Poll script now probes the **container's external link-local IP first**
+  (e.g. `169.254.0.x` from `hostname -I`); only that path is reachable by
+  the e2b preview proxy. A second pass tries `127.0.0.1` and reports
+  `LOCAL_ONLY` so we can warn the user that the app bound to loopback only.
+- New `LOCAL_ONLY` heartbeat: `→ Hybrid poller: Python backend listening
+  on 127.0.0.1:NNNN but NOT on the container's external IP … set
+  HOST=0.0.0.0 / LDR_HOST=0.0.0.0 / FLASK_RUN_HOST=0.0.0.0 in Advanced …`
+- Poll script also lists TCP-open ports for progress hints.
+- Heartbeat status line emitted on the **first probe** (so the user sees
+  the new poller is alive) and every ~15s after that.
 - When the 3-min poll window finally expires, emit a hint pointing at
   `Advanced > Environment variables` (`PORT=NNNN`) instead of silently
   giving up.
