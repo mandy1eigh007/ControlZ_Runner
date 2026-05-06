@@ -261,6 +261,78 @@ app.get(
       (stream: "stdout" | "stderr") =>
       (data: string) =>
         send("log", { stream, line: data });
+
+    // Wraps `log()` for noisy package-install commands (pip / uv pip / npm).
+    // A full LDR install dumps 200+ lines of `+ pkgname==1.2.3` and even more
+    // `Downloading X (NN MiB)` lines, which buries useful signal. We:
+    //   - drop the per-package install-confirmation lines
+    //   - drop the per-file "Downloading" / "Downloaded" / "Prepared" chatter
+    //   - keep "Resolved N packages" / "Installed N packages" summary lines
+    //   - keep ANY line containing error/warning/traceback/failed
+    //   - keep stderr verbatim (errors deserve full visibility)
+    //   - emit a periodic heartbeat (`… quieted N lines, still working`) so
+    //     long silent stretches don't look like a hang
+    const quietPipLog = (stream: "stdout" | "stderr") => {
+      let dropped = 0;
+      let lastHeartbeat = Date.now();
+      const HEARTBEAT_MS = 8_000;
+      const DROP_PATTERNS: RegExp[] = [
+        // `+ package==1.2.3` or ` + package==1.2.3 (from ...)` from uv pip
+        /^\s*\+\s+[A-Za-z0-9_.-]+==[^\s]+/,
+        // uv per-file download chatter
+        /^\s*Downloading\s+[A-Za-z0-9_.-]+\s+\([\d.]+\s*[KMG]i?B\)/i,
+        /^\s*\u2713?\s*Downloaded\s+[A-Za-z0-9_.-]+\s*$/i,
+        // pip's `Collecting xyz` / `Downloading xyz-1.2.3-...whl` lines
+        /^\s*Collecting\s+[A-Za-z0-9_.-]+/,
+        /^\s*Downloading\s+\S+\.whl/,
+        /^\s*Downloading\s+\S+\.tar\.gz/,
+        // pip progress bars (rendered as plain text by e2b)
+        /^\s*[\u2500-\u259F\u2580-\u259F]+\s+[\d.]+\/[\d.]+\s*[KMG]?B/,
+        // npm "Downloading…" extras
+        /^\s*npm\s+notice/,
+      ];
+      const KEEP_PATTERNS: RegExp[] = [
+        /error|warning|traceback|failed|fatal|killed|cannot|unable/i,
+        /Resolved\s+\d+\s+packages?/i,
+        /Installed\s+\d+\s+packages?/i,
+        /Prepared\s+\d+\s+packages?/i,
+        /Built\s+/,
+        /Building\s+/,
+        /Successfully installed/i,
+      ];
+      return (data: string) => {
+        // Always pass stderr through unfiltered — errors must be visible.
+        if (stream === "stderr") {
+          if (data) send("log", { stream, line: data });
+          return;
+        }
+        const lines = data.split(/\r?\n/);
+        const kept: string[] = [];
+        for (const ln of lines) {
+          if (!ln.trim()) continue;
+          if (KEEP_PATTERNS.some((rx) => rx.test(ln))) {
+            kept.push(ln);
+            continue;
+          }
+          if (DROP_PATTERNS.some((rx) => rx.test(ln))) {
+            dropped++;
+            continue;
+          }
+          kept.push(ln);
+        }
+        if (kept.length) {
+          send("log", { stream, line: kept.join("\n") });
+        }
+        const now = Date.now();
+        if (dropped > 0 && now - lastHeartbeat >= HEARTBEAT_MS) {
+          send("log", {
+            stream: "status",
+            line: `… still installing (quieted ${dropped} routine lines so far)`,
+          });
+          lastHeartbeat = now;
+        }
+      };
+    };
     const status = (s: string) => send("status", s);
     const errorAndEnd = (msg: string) => {
       send("error", msg);
@@ -801,8 +873,8 @@ app.get(
           );
           const ni = await sbx.commands.run(npmInstall, {
             cwd: "/home/user/repo",
-            onStdout: log("stdout"),
-            onStderr: log("stderr"),
+            onStdout: quietPipLog("stdout"),
+            onStderr: quietPipLog("stderr"),
             timeoutMs: INSTALL_TIMEOUT_MS_NODE,
           });
           if (ni.exitCode !== 0) {
@@ -818,8 +890,8 @@ app.get(
           );
           const pi = await sbx.commands.run(pyInstall, {
             cwd: "/home/user/repo",
-            onStdout: log("stdout"),
-            onStderr: log("stderr"),
+            onStdout: quietPipLog("stdout"),
+            onStderr: quietPipLog("stderr"),
             timeoutMs: INSTALL_TIMEOUT_MS_PYTHON,
           });
           if (pi.exitCode !== 0) {
@@ -931,8 +1003,8 @@ app.get(
         });
         const ins = await sbx.commands.run(installCmd, {
           cwd: "/home/user/repo",
-          onStdout: log("stdout"),
-          onStderr: log("stderr"),
+          onStdout: quietPipLog("stdout"),
+          onStderr: quietPipLog("stderr"),
           timeoutMs: installTimeoutMs,
         });
         if (ins.exitCode !== 0) {

@@ -10,6 +10,29 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P2-12: quieter pip / npm install logs
+
+Install commands now route stdout through a `quietPipLog()` filter that
+drops the high-noise lines:
+
+- `+ pkgname==1.2.3` per-package install confirmations (LDR alone produces
+  ~260 of these)
+- `Downloading X (NN MiB)` / `Downloaded X` per-file uv chatter
+- `Collecting X` / `Downloading X-1.2.3-…whl` from pip
+- `npm notice` upgrade nags
+
+Lines containing `error|warning|traceback|failed|fatal|killed|cannot|unable`
+are always kept. Summary lines (`Resolved N packages`, `Installed N
+packages`, `Built foo`, `Building bar`) are always kept. Stderr is passed
+through unfiltered. A heartbeat `… still installing (quieted N routine
+lines so far)` is emitted every 8s when lines are being dropped, so long
+silent installs don't look like a hang.
+
+Wired into all three install paths: pure-Node, hybrid npm-then-pip, and
+the generic `installCmd` path.
+
+---
+
 ## 2026-05-06 — P2-13: recent-repos history (localStorage)
 
 URL input now remembers up to 20 recently-used GitHub repos, persisted to
