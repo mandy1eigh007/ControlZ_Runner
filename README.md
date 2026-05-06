@@ -67,6 +67,18 @@ A custom command from the Advanced field overrides detection entirely.
 - Sandboxes are killed when: the user clicks Stop, the SSE connection drops (tab closed), the 10-min timeout fires, or the server shuts down (SIGINT/SIGTERM). No leaked sandboxes burning credits.
 - Vite-specific repos get `--host 0.0.0.0` appended and `__VITE_ADDITIONAL_*_ALLOWED_HOSTS` env vars set so the E2B preview URL isn't blocked
 
+## Hybrid (Python + Vite) notes
+
+Some repos run a **Python backend** plus a **Vite dev server** (often as an asset server).
+
+- RepoRunner surfaces multiple preview targets (tabs) when it detects multiple ports.
+- Vite’s logged “base path” can be misleading. For example, a Vite server may:
+	- log `http://localhost:5173/static/`
+	- redirect `/` → `/static/` (302)
+	- but still return 404 on `/static/`
+
+RepoRunner seeds the initial Vite preview to `/` and uses best-effort diagnostics to pick a working path when the first choice 404s.
+
 ## Deploying
 
 Frontend: any static host (Vercel, Netlify, Cloudflare Pages) — `npm run build` produces a static `dist/`.
