@@ -44,6 +44,10 @@ Preview diagnostics are now best-effort (no hard failure) to avoid confusing
 This includes the initial “wait for port to respond” step, which now fails
 softly and logs `skipping probe` instead of surfacing an exception.
 
+The readiness check also now normalizes curl’s `%{http_code}` output to avoid
+false-positives on connection errors (which can otherwise look “ready” and
+trigger an early probe).
+
 ---
 
 ## 2026-05-06 — P2-12: quieter pip / npm install logs
