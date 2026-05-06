@@ -507,6 +507,28 @@ app.get(
         return script + "\n";
       };
 
+      // Shell prefix that defines a `pip_install` function preferring `uv pip`
+      // (10-100x faster than pip) when a venv is active and uv is on PATH.
+      // Lazily installs uv (~5s) the first time it's used inside a venv.
+      // Falls back to `python -m pip install` for non-venv installs to avoid
+      // uv's --system requirement and keep behavior identical to the legacy
+      // path when ensurePythonEnvPrefix didn't fire.
+      const PIP_SHIM_PREFIX = [
+        "pip_install() {",
+        '  if [ -n "${VIRTUAL_ENV:-}" ]; then',
+        "    if ! command -v uv >/dev/null 2>&1; then",
+        '      curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 || true',
+        '      export PATH="$HOME/.local/bin:$PATH"',
+        "    fi",
+        "    if command -v uv >/dev/null 2>&1; then",
+        '      uv pip install "$@" && return 0',
+        "    fi",
+        "  fi",
+        '  python -m pip install "$@"',
+        "}",
+        "",
+      ].join("\n");
+
       // Scan pyproject.toml + requirements.txt for `torch` to decide whether
       // to use the CPU-only PyTorch wheel index. The default index pulls
       // ~2GB of CUDA wheels (nvidia-cublas, nvidia-cudnn-cu13, etc.) which
@@ -544,7 +566,7 @@ app.get(
         return [
           'export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu"',
           'export PIP_NO_CACHE_DIR=1',
-          'python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch || true',
+          'pip_install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch || true',
           "",
         ].join("\n");
       };
@@ -561,9 +583,9 @@ app.get(
       > => {
         let install: string | null = null;
         if (await has("requirements.txt")) {
-          install = "python -m pip install -r requirements.txt";
+          install = "pip_install -r requirements.txt";
         } else if (await has("pyproject.toml")) {
-          install = "python -m pip install .";
+          install = "pip_install .";
         } else {
           return null;
         }
@@ -739,9 +761,11 @@ app.get(
 
           const pyPrefix = await ensurePythonEnvPrefix(hybridPy.pyMin);
           const mlPrefix = await detectHeavyMlDeps();
-          const pyInstall = pyPrefix || mlPrefix
-            ? bashLc((pyPrefix || "") + (mlPrefix || "") + hybridPy.install)
-            : hybridPy.install;
+          // Always wrap with bashLc so PIP_SHIM_PREFIX (which defines
+          // `pip_install`) is in scope for hybridPy.install.
+          const pyInstall = bashLc(
+            (pyPrefix || "") + PIP_SHIM_PREFIX + (mlPrefix || "") + hybridPy.install,
+          );
           const pi = await sbx.commands.run(pyInstall, {
             cwd: "/home/user/repo",
             onStdout: log("stdout"),
@@ -817,8 +841,8 @@ app.get(
         }
         const pyPrefix = await ensurePythonEnvPrefix(py.pyMin);
         const mlPrefix = await detectHeavyMlDeps();
-        const combined = (pyPrefix || "") + (mlPrefix || "");
-        installCmd = combined ? bashLc(combined + py.install) : py.install;
+        const combined = (pyPrefix || "") + PIP_SHIM_PREFIX + (mlPrefix || "");
+        installCmd = bashLc(combined + py.install);
         startCmd = pyPrefix ? bashLc(pyPrefix + py.start) : py.start;
         installTimeoutMs = INSTALL_TIMEOUT_MS_PYTHON;
       } else if (wantsStack("rust") && (await has("Cargo.toml"))) {

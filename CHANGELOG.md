@@ -10,6 +10,21 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P1-8: prefer `uv pip` for Python installs
+
+Added a `PIP_SHIM_PREFIX` shell snippet that defines a `pip_install()` bash
+function: when a venv is active and `uv` is on PATH (or can be lazily
+installed via the official installer in ~5s), it routes `pip install` calls
+through `uv pip install` (typically 10-100x faster, especially for large
+dep graphs like LDR's). Falls back to `python -m pip install` cleanly when
+no venv is active. Both Python install branches (hybrid + pure) now always
+wrap their install command in `bashLc(... + PIP_SHIM_PREFIX + ...)` so the
+shim is in scope. The CPU torch pre-install also routes through
+`pip_install`. No behavior change when uv install fails — pip is always
+the safety net.
+
+---
+
 ## 2026-05-06 — P1-7: detect Django / ASGI / WSGI Python entry points
 
 `detectPythonStart()` now recognizes three additional conventional layouts
