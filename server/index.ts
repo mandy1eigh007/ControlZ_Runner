@@ -1851,6 +1851,48 @@ app.get(
         // First probe after 4s — Flask can start binding very quickly when
         // there's no model load; waiting 10s just felt like a hang.
         setTimeout(() => void tick(), 4_000);
+
+        // ─────────────────────────────────────────────────────────────
+        // Process diagnostics: when the start command appears to hang
+        // (no port appears within 30s, then 90s, then 180s), dump what's
+        // actually running inside the sandbox so we can see whether the
+        // process is alive, dead, or bound to an unexpected address.
+        // This is generic and helps any "silent death" case, not just
+        // hybrids.
+        // ─────────────────────────────────────────────────────────────
+        const diagScript = [
+          "set +e",
+          "echo '--- ps (python/node/gunicorn/uvicorn/uv) ---'",
+          "ps -ef 2>/dev/null | grep -E '(python|node|gunicorn|uvicorn|uv |hypercorn|daphne|streamlit|gradio|flask)' | grep -v grep | head -20 || true",
+          "echo '--- listening sockets (ss / netstat) ---'",
+          "(ss -lntp 2>/dev/null || netstat -lntp 2>/dev/null || true) | head -20",
+          "echo '--- recent .log files in repo (last 10 lines each) ---'",
+          "find /home/user/repo -maxdepth 3 -name '*.log' -mmin -5 2>/dev/null | head -5 | while read f; do echo \"== $f ==\"; tail -10 \"$f\" 2>/dev/null; done",
+          "echo '--- end diagnostics ---'",
+        ].join("\n");
+        const dumpDiagnostics = async (label: string) => {
+          if (closed) return;
+          if (previewUrl) return; // already have a preview — no point
+          try {
+            const r = await sbx.commands.run(bashLc(diagScript));
+            const out = (r.stdout || "").trim();
+            if (!out) return;
+            send("log", {
+              stream: "status",
+              line: `→ Process diagnostics (${label}):`,
+            });
+            for (const line of out.split("\n")) {
+              if (line.trim()) {
+                send("log", { stream: "stdout", line: `  ${line}` });
+              }
+            }
+          } catch {
+            // best effort — never fail the run
+          }
+        };
+        setTimeout(() => void dumpDiagnostics("30s"), 30_000);
+        setTimeout(() => void dumpDiagnostics("90s"), 90_000);
+        setTimeout(() => void dumpDiagnostics("180s"), 180_000);
       }
 
       // Fallback: if no port detected from logs after PREVIEW_FALLBACK_MS,

@@ -10,6 +10,33 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P0-FIX-8: process diagnostics dump on hang
+
+When `ldr-web` (and other socketio.run-based apps) hangs after `create_app()`
+without binding any port, the user just sees the backend poller report
+"no ports listening yet" forever. We had no visibility into whether the
+process was alive, dead, or stuck on something.
+
+**Changes — [server/index.ts](server/index.ts):**
+
+- New `dumpDiagnostics(label)` helper that runs inside the sandbox at
+  T+30s, T+90s, T+180s after the Python start command launches (skipped
+  if a preview URL already exists by then).
+- Diagnostics include:
+  - `ps -ef | grep` for python/node/gunicorn/uvicorn/uv/hypercorn/daphne/
+    streamlit/gradio/flask processes (top 20)
+  - Listening sockets via `ss -lntp` or `netstat -lntp` fallback
+  - Tail of the last 10 lines of any `*.log` file in the repo modified
+    in the last 5 minutes
+- Output is prefixed with `→ Process diagnostics (30s):` so it's clearly
+  scoped, and individual lines are sent as `stdout` events for proper
+  formatting in the log pane.
+
+Best-effort: any error in the diagnostic script is swallowed silently —
+this never blocks or fails a run.
+
+---
+
 ## 2026-05-06 — P0-FIX-7: extend backend poller to all Python stacks
 
 After P0-FIX-6 made build-mode hybrids run as `python-pure`, we lost the
