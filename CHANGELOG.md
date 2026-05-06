@@ -10,6 +10,17 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P2-14: categorized error messages
+
+Top-level run failures are now categorized with actionable hints.
+
+- The SSE `error` payload remains a string (UI-compatible), but is now formatted as:
+  `[code] Title\nHint: …\nDetails: …`.
+- Categories cover common cases like missing/invalid `E2B_API_KEY`, repo not found,
+  missing entrypoints, install failures, timeouts, and OOM-kills (`Killed`).
+
+---
+
 ## 2026-05-06 — P2-11: multi-port preview tabs (hybrid)
 
 Hybrid repos (Python backend + Vite asset server) now surface multiple preview

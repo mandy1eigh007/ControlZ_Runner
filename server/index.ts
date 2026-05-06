@@ -334,8 +334,108 @@ app.get(
       };
     };
     const status = (s: string) => send("status", s);
+
+    type ErrorCode =
+      | "invalid-github-url"
+      | "missing-e2b-api-key"
+      | "repo-not-found"
+      | "stack-detect-failed"
+      | "missing-entrypoint"
+      | "install-failed"
+      | "install-timeout"
+      | "runtime-failed"
+      | "oom-killed"
+      | "unknown";
+
+    const categorizeError = (raw: string): { code: ErrorCode; title: string; hint?: string } => {
+      const msg = (raw || "").trim();
+      const m = msg.toLowerCase();
+
+      if (!msg) return { code: "unknown", title: "Unknown error" };
+
+      if (m.includes("invalid github url")) {
+        return {
+          code: "invalid-github-url",
+          title: "Invalid GitHub URL",
+          hint: "Use https://github.com/<owner>/<repo> for a public repo.",
+        };
+      }
+      if (m.includes("e2b_api_key")) {
+        return {
+          code: "missing-e2b-api-key",
+          title: "Missing or invalid E2B API key",
+          hint: "Set E2B_API_KEY in .env (no quotes/newlines), restart the backend, and try again.",
+        };
+      }
+      if (m.includes("repository not found") || m.includes("not public") || m.includes("repository not found or not public")) {
+        return {
+          code: "repo-not-found",
+          title: "Repository not found or not public",
+          hint: "Make sure the repo exists and is public (private repos aren’t supported yet).",
+        };
+      }
+
+      // Detection / entry point issues.
+      if (m.includes("could not detect how to run")) {
+        return {
+          code: "stack-detect-failed",
+          title: "Could not detect how to run this repo",
+          hint: "Open Advanced and provide a custom start command (or choose a stack override).",
+        };
+      }
+      if (m.includes("package.json has no dev/start/serve")) {
+        return {
+          code: "missing-entrypoint",
+          title: "No Node start script found",
+          hint: "Add a dev/start/serve script to package.json, or use Advanced with a custom command.",
+        };
+      }
+      if (m.includes("no python entry found") || m.includes("no app.py") || m.includes("no main.py") || m.includes("no [project.scripts]")) {
+        return {
+          code: "missing-entrypoint",
+          title: "No Python entrypoint found",
+          hint: "Add app.py/main.py/streamlit_app.py, or define [project.scripts] in pyproject.toml, or use Advanced with a custom command.",
+        };
+      }
+
+      // Timeouts and resource failures.
+      if (m.includes("timeout") || m.includes("timed out")) {
+        // Most timeouts in this app are install timeouts, but keep it generic.
+        return {
+          code: "install-timeout",
+          title: "Command timed out",
+          hint: "Try again (cold sandboxes can be slow), or use Advanced to run a smaller install/start command.",
+        };
+      }
+      if (m.includes("killed") || m.includes("oom") || m.includes("out of memory")) {
+        return {
+          code: "oom-killed",
+          title: "Sandbox ran out of memory (process was killed)",
+          hint: "This repo may pull heavy native/ML deps. Try a lighter command, CPU-only deps, or trimming optional extras.",
+        };
+      }
+
+      // Install failures.
+      if (m.includes("npm install failed") || m.includes("python install failed") || m.includes("install failed")) {
+        return {
+          code: "install-failed",
+          title: "Dependency install failed",
+          hint: "Check the logs for the first error. You may need extra system libs (not present in the base sandbox) or env vars.",
+        };
+      }
+
+      return { code: "unknown", title: "Run failed", hint: "Check the logs above for the first error line." };
+    };
+
+    const formatUserError = (raw: string): string => {
+      const info = categorizeError(raw);
+      const details = raw?.trim() ? `\nDetails: ${raw.trim()}` : "";
+      const hint = info.hint ? `\nHint: ${info.hint}` : "";
+      return `[${info.code}] ${info.title}${hint}${details}`;
+    };
+
     const errorAndEnd = (msg: string) => {
-      send("error", msg);
+      send("error", formatUserError(msg));
       clearInterval(heartbeat);
       closed = true;
       try {
