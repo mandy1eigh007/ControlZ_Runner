@@ -434,6 +434,48 @@ app.get(
         return script + "\n";
       };
 
+      // Scan pyproject.toml + requirements.txt for `torch` to decide whether
+      // to use the CPU-only PyTorch wheel index. The default index pulls
+      // ~2GB of CUDA wheels (nvidia-cublas, nvidia-cudnn-cu13, etc.) which
+      // OOM-kills the e2b sandbox before the app can start. The CPU wheel is
+      // ~200MB and pulls zero NVIDIA deps. Returns a shell prefix to prepend
+      // to the install command (sets PIP_EXTRA_INDEX_URL + pre-installs
+      // torch from the CPU index), or "" if torch isn't requested.
+      const detectHeavyMlDeps = async (): Promise<string> => {
+        let blob = "";
+        try {
+          if (await has("pyproject.toml")) {
+            blob += await sbx.files.read("/home/user/repo/pyproject.toml");
+          }
+        } catch {}
+        try {
+          if (await has("requirements.txt")) {
+            blob += "\n" + await sbx.files.read("/home/user/repo/requirements.txt");
+          }
+        } catch {}
+        // Match `torch` as a top-level dep (not `torchvision`, `torchaudio`
+        // standalone are also pulled in by torch). `\btorch\b` would match
+        // strings inside other names; use a tighter check.
+        const wantsTorch = /(^|[\n,\s\"'\[])torch(?:\s*[<>=!~]|\s*[,\"'\]\n]|$)/m.test(blob);
+        if (!wantsTorch) return "";
+
+        send("log", {
+          stream: "status",
+          line: "→ Detected `torch` in deps; pre-installing CPU-only PyTorch (~200MB) instead of default CUDA build (~2GB) to fit the sandbox.",
+        });
+
+        // Pre-install CPU torch BEFORE the main install so resolution picks
+        // the already-installed version. Set PIP_EXTRA_INDEX_URL so any
+        // remaining torch-related deps (torchvision, torchaudio) also resolve
+        // from the CPU index. Keep PIP_NO_CACHE_DIR=1 to free disk pressure.
+        return [
+          'export PIP_EXTRA_INDEX_URL="https://download.pytorch.org/whl/cpu"',
+          'export PIP_NO_CACHE_DIR=1',
+          'python -m pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch || true',
+          "",
+        ].join("\n");
+      };
+
       // Detect a Python install + start command pair. Used by both the
       // pure-Python branch and the hybrid Python+Vite branch.
       // Resolution order:
@@ -592,8 +634,9 @@ app.get(
           }
 
           const pyPrefix = await ensurePythonEnvPrefix(hybridPy.pyMin);
-          const pyInstall = pyPrefix
-            ? bashLc(pyPrefix + hybridPy.install)
+          const mlPrefix = await detectHeavyMlDeps();
+          const pyInstall = pyPrefix || mlPrefix
+            ? bashLc((pyPrefix || "") + (mlPrefix || "") + hybridPy.install)
             : hybridPy.install;
           const pi = await sbx.commands.run(pyInstall, {
             cwd: "/home/user/repo",
@@ -669,7 +712,9 @@ app.get(
           );
         }
         const pyPrefix = await ensurePythonEnvPrefix(py.pyMin);
-        installCmd = pyPrefix ? bashLc(pyPrefix + py.install) : py.install;
+        const mlPrefix = await detectHeavyMlDeps();
+        const combined = (pyPrefix || "") + (mlPrefix || "");
+        installCmd = combined ? bashLc(combined + py.install) : py.install;
         startCmd = pyPrefix ? bashLc(pyPrefix + py.start) : py.start;
         installTimeoutMs = INSTALL_TIMEOUT_MS_PYTHON;
       } else if (wantsStack("rust") && (await has("Cargo.toml"))) {
@@ -1066,6 +1111,54 @@ app.get(
         onStdout: (data) => handleLine("stdout", data),
         onStderr: (data) => handleLine("stderr", data),
       });
+
+      // Hybrid mode: many Flask/Django apps don't log a parseable
+      // "Running on http://..." line (e.g. socketio.run, gunicorn workers,
+      // custom loggers via loguru). Actively poll the typical Python web
+      // ports every 5s for ~3 min and rebind preview when one starts
+      // returning a non-empty body. This complements the log-based detection
+      // in handleLine() and the one-shot fallback timer below.
+      if (hybridMode) {
+        const pyPorts = [5000, 8000, 8080, 3000];
+        const pollScript = [
+          "set -e",
+          "command -v curl >/dev/null 2>&1 || exit 0",
+          `for p in ${pyPorts.join(" ")}; do`,
+          "  body=$(curl -fsS --max-time 3 \"http://127.0.0.1:$p/\" 2>/dev/null | head -c 32 || true)",
+          '  if [ -n "$body" ]; then echo $p; exit 0; fi',
+          "done",
+          "exit 0",
+        ].join("\n");
+
+        const start = Date.now();
+        const POLL_MAX_MS = 3 * 60_000;
+        const POLL_INTERVAL_MS = 5_000;
+        const tick = async () => {
+          if (closed) return;
+          if (Date.now() - start > POLL_MAX_MS) return;
+          try {
+            const r = await sbx.commands.run(bashLc(pollScript));
+            const found = parseInt((r.stdout || "").trim(), 10);
+            if (!Number.isNaN(found)) {
+              const cur = previewUrl ? previewUrl.match(/^https:\/\/(\d+)-/) : null;
+              const curPort = cur ? Number(cur[1]) : null;
+              if (curPort !== found) {
+                send("log", {
+                  stream: "status",
+                  line: `→ Hybrid poller: Python backend responding on :${found}; rebinding preview from :${curPort ?? "?"}.`,
+                });
+                sendPreview(found, undefined, { force: true });
+              }
+              return;
+            }
+          } catch {
+            // ignore — try again on next tick
+          }
+          setTimeout(() => void tick(), POLL_INTERVAL_MS);
+        };
+        // First probe after 10s to give Flask a head start.
+        setTimeout(() => void tick(), 10_000);
+      }
 
       // Fallback: if no port detected from logs after PREVIEW_FALLBACK_MS,
       // optimistically expose the most likely port for the detected stack.

@@ -10,6 +10,35 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P0-FIX-3 / P0-FIX-4: avoid CUDA OOM + active hybrid port poll
+
+LDR install OOM-killed the sandbox: `torch` from PyPI defaults pulled
+~2GB of CUDA wheels (`nvidia-cublas`, `nvidia-cudnn-cu13`, `nvidia-cusparse`,
+`triton`, etc.) which the e2b sandbox couldn't fit in memory. Vite + Flask
+were both `Killed` mid-boot. Separately, even when Flask did boot it didn't
+log a parseable `Running on http://...` line so we never rebound preview.
+
+**P0-FIX-3 — CPU-only torch wheel:**
+- New `detectHeavyMlDeps()` scans pyproject + requirements for top-level
+  `torch` dep.
+- When found, prepends a shell prefix to the Python install that:
+  - sets `PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu`
+  - sets `PIP_NO_CACHE_DIR=1`
+  - pre-installs `torch` from the CPU index (~200MB, zero NVIDIA deps)
+- Subsequent `pip install .` resolution finds torch already installed and
+  skips the CUDA wheels entirely.
+
+**P0-FIX-4 — active hybrid port poll:**
+- After the primary command starts in hybrid mode, kick off a poller that
+  curls `http://127.0.0.1:{5000,8000,8080,3000}/` every 5s for up to 3min.
+- First port returning a non-empty body wins; preview rebinds with `force`.
+- Complements (doesn't replace) log-based detection and the one-shot
+  fallback timer; this catches Flask/Django apps with custom loggers
+  (loguru, gunicorn workers, socketio.run) that don't emit a parseable
+  startup line.
+
+---
+
 ## 2026-05-06 — P0-FIX-2: hybrid Flask port rebind + smarter preview probe
 
 LDR (Flask + Vite hybrid) preview was locking onto port 3000 (or whatever
