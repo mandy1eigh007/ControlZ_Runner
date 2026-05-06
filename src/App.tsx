@@ -46,6 +46,39 @@ export function App() {
   const [detectedStack, setDetectedStack] = useState<string | null>(null);
   const [activeSandbox, setActiveSandbox] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  // Recent repos history (most-recent-first, deduped, capped). Persisted to
+  // localStorage so it survives reloads. Used to power a native <datalist>
+  // dropdown attached to the URL input — no extra UI surface, just type or
+  // click the chevron to pick a previous repo.
+  const RECENT_KEY = "reporunner.recentRepos.v1";
+  const RECENT_MAX = 20;
+  const [recentRepos, setRecentRepos] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(RECENT_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  });
+  const pushRecentRepo = (repoUrl: string) => {
+    const u = repoUrl.trim();
+    if (!u) return;
+    setRecentRepos((prev) => {
+      const next = [u, ...prev.filter((x) => x !== u)].slice(0, RECENT_MAX);
+      try {
+        localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+      } catch {
+        // localStorage may be disabled (private mode quotas, etc.) — ignore.
+      }
+      return next;
+    });
+  };
+  const clearRecentRepos = () => {
+    setRecentRepos([]);
+    try { localStorage.removeItem(RECENT_KEY); } catch {}
+  };
 
   const termRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
@@ -183,6 +216,8 @@ export function App() {
       }
       const { sandboxId } = (await res.json()) as { sandboxId: string };
       setActiveSandbox(sandboxId);
+      // Successfully kicked off a run — record the URL in history.
+      pushRecentRepo(url.trim());
 
       // /stream looks up url/customCommand/stack/envs from server-side config
       // keyed on sandboxId; nothing sensitive (env vars) is sent in the URL.
@@ -257,9 +292,15 @@ export function App() {
       </div>
       <div className="flex gap-2 px-4 py-3">
         <input type="text" value={url}
+          list="recent-repos"
           onChange={(e) => setUrl(e.target.value)} onKeyDown={onUrlKey}
           placeholder="Paste a public GitHub repo URL" disabled={running}
           className="flex-1 rounded border border-emerald-900/60 bg-neutral-950 px-3 py-2 text-sm text-emerald-200 placeholder:text-emerald-700 focus:border-emerald-600/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70 focus-visible:ring-offset-2 focus-visible:ring-offset-neutral-950 disabled:opacity-60" />
+        <datalist id="recent-repos">
+          {recentRepos.map((r) => (
+            <option key={r} value={r} />
+          ))}
+        </datalist>
         <button onClick={handleRun}
           disabled={starting || running || !url.trim()}
           className="flex min-w-[88px] items-center justify-center rounded border border-emerald-700/60 bg-emerald-900 px-4 py-2 text-sm font-medium text-emerald-50 hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/80 focus-visible:ring-offset-2 focus-visible:ring-offset-neutral-950 disabled:cursor-not-allowed disabled:border-emerald-900/40 disabled:bg-neutral-950 disabled:text-emerald-700/60">
@@ -268,6 +309,37 @@ export function App() {
           ) : ("Run")}
         </button>
       </div>
+      {recentRepos.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1.5 px-4 pb-2 text-xs">
+          <span className="mr-1 text-emerald-700">Recent:</span>
+          {recentRepos.slice(0, 5).map((r) => {
+            // Show just owner/name to keep chips compact.
+            const m = /github\.com\/([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/.exec(r);
+            const label = m ? `${m[1]}/${m[2]}` : r;
+            return (
+              <button
+                key={r}
+                type="button"
+                onClick={() => setUrl(r)}
+                disabled={running}
+                title={r}
+                className="max-w-[28ch] truncate rounded-full border border-emerald-900/60 bg-neutral-950 px-2.5 py-0.5 text-emerald-300 hover:border-emerald-700/60 hover:text-emerald-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {label}
+              </button>
+            );
+          })}
+          <button
+            type="button"
+            onClick={clearRecentRepos}
+            disabled={running}
+            className="ml-auto text-emerald-700 hover:text-rose-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70 disabled:cursor-not-allowed disabled:opacity-60"
+            title="Clear history"
+          >
+            clear
+          </button>
+        </div>
+      )}
       <details className="px-4 pb-2 text-sm">
         <summary className="cursor-pointer select-none text-emerald-400/80 hover:text-emerald-200">
           Advanced

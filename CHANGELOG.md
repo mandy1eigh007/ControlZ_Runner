@@ -10,6 +10,23 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P2-13: recent-repos history (localStorage)
+
+URL input now remembers up to 20 recently-used GitHub repos, persisted to
+`localStorage` under `reporunner.recentRepos.v1`. Two ways to recall a URL:
+
+1. The URL `<input>` is wired to a `<datalist>` so the browser shows native
+   autocomplete as you type.
+2. The most-recent 5 repos render as compact `owner/name` chips directly
+   below the URL row — click to populate the input. A small `clear` button
+   wipes history.
+
+Push happens once a sandbox is successfully created (so failed/typo'd URLs
+don't pollute history). Storage failures (private mode quotas, etc.) are
+swallowed silently.
+
+---
+
 ## 2026-05-06 — P2-10: status pill shows detected stack + preview port
 
 Server now emits a typed `stack` SSE event from `setPrimaryStack()` carrying
