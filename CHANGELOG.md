@@ -10,6 +10,26 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P1-9: refactor isVite/hybridMode mutation into primaryStack enum
+
+Replaced the two-boolean (`isVite`, `hybridMode`) state machine, which had to
+be mutated mid-flow (`isVite = false; hybridMode = true;` once a hybrid
+Python+Vite repo was detected), with an explicit `primaryStack` enum:
+
+```
+type PrimaryStack =
+  | "unknown" | "node-vite" | "node-other" | "python-pure"
+  | "python-hybrid-vite" | "static" | "rust" | "go" | "custom";
+```
+
+Single-assignment via a `setPrimaryStack()` helper that also emits a
+`→ Primary stack: <name>` status log line so users can see which branch was
+taken. `isVite` / `hybridMode` reads are now derived getters (`getIsVite()`,
+`getHybridMode()`) — no behavior change, just clearer intent and easier
+extension for upcoming P2 work (status pill, multi-port awareness).
+
+---
+
 ## 2026-05-06 — P1-8: prefer `uv pip` for Python installs
 
 Added a `PIP_SHIM_PREFIX` shell snippet that defines a `pip_install()` bash

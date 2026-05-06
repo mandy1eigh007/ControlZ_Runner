@@ -363,13 +363,38 @@ app.get(
 
       let installCmd: string | null = null;
       let startCmd: string | null = null;
-      let isVite = false;
-      // True for Flask/Django + Vite hybrid repos. Vite is asset-only and
-      // the Python backend serves the actual HTML on a different port
-      // (commonly 5000 for Flask, 8000 for Django). Affects fallback port
-      // probing and lets us rebind preview when Flask logs its real port
-      // after the initial Vite-driven detection.
-      let hybridMode = false;
+      // Single source of truth for what we're actually running. Replaces the
+      // old `isVite` boolean + `hybridMode` boolean pair, which had to be
+      // mutated mid-flow (`isVite = false; hybridMode = true;`) and made it
+      // hard to reason about which branch downstream code was on.
+      // - "unknown": detection hasn't run yet (or stack didn't match anything)
+      // - "node-vite": npm-managed Vite app, primary preview is Vite on :5173
+      // - "node-other": npm-managed non-Vite app (Next/Express/etc.)
+      // - "python-pure": Python is the only thing running
+      // - "python-hybrid-vite": Python is primary, Vite runs as background
+      //   asset server (e.g. Flask + Vite hybrids like LDR)
+      // - "static" / "rust" / "go" / "custom": as named
+      type PrimaryStack =
+        | "unknown"
+        | "node-vite"
+        | "node-other"
+        | "python-pure"
+        | "python-hybrid-vite"
+        | "static"
+        | "rust"
+        | "go"
+        | "custom";
+      let primaryStack: PrimaryStack = "unknown";
+      const setPrimaryStack = (s: PrimaryStack) => {
+        primaryStack = s;
+        send("log", { stream: "status", line: `→ Primary stack: ${s}` });
+      };
+      // Backward-compatible derived view: `isVite` means "the primary preview
+      // we expect on :5173 is Vite". Hybrid mode flips this off because the
+      // primary preview is the Python backend (Vite is asset-only). Read-only
+      // — never assign; assign to primaryStack instead.
+      const getIsVite = () => primaryStack === "node-vite";
+      const getHybridMode = () => primaryStack === "python-hybrid-vite";
       // Per-install timeout, chosen by the branch that owns the install.
       // Defaults to the conservative generic value; overridden below.
       let installTimeoutMs = INSTALL_TIMEOUT_MS;
@@ -694,6 +719,7 @@ app.get(
 
       if (customCommand) {
         startCmd = customCommand;
+        setPrimaryStack("custom");
       } else if (wantsStack("node", "hybrid-py-node") && (await has("package.json"))) {
         installCmd = "npm install --no-audit --no-fund --loglevel=error";
         const pkgText = await sbx.files.read("/home/user/repo/package.json");
@@ -706,13 +732,18 @@ app.get(
           ...(pkg.dependencies || {}),
           ...(pkg.devDependencies || {}),
         };
-        isVite = "vite" in allDeps;
+        const hasVite = "vite" in allDeps;
+        // Tentative — may be promoted to "python-hybrid-vite" below if a
+        // Python backend is also detected. We don't call setPrimaryStack
+        // here because we don't want to log a misleading status that we'll
+        // immediately overwrite.
+        let tentativeNodeStack: PrimaryStack = hasVite ? "node-vite" : "node-other";
 
         const enginesMajor = parseEnginesNodeMajor(pkg?.engines?.node);
-        const needsModernNode = isVite || (typeof enginesMajor === "number" && enginesMajor >= 24);
+        const needsModernNode = hasVite || (typeof enginesMajor === "number" && enginesMajor >= 24);
         const nodePrefix = needsModernNode
           ? await ensureModernNodePrefix(
-              isVite
+              hasVite
                 ? "Vite requires newer Node"
                 : `package.json engines.node suggests >=${enginesMajor}`,
             )
@@ -730,7 +761,7 @@ app.get(
           (await has("pyproject.toml")) || (await has("requirements.txt"));
         const forceHybrid = stackOverride === "hybrid-py-node";
         const hybridPy =
-          (forceHybrid || isVite) && hasPython
+          (forceHybrid || hasVite) && hasPython
             ? await detectPythonStart()
             : null;
         if (forceHybrid && !hybridPy) {
@@ -807,12 +838,12 @@ app.get(
             ? bashLc(pyPrefix + hybridPy.start)
             : hybridPy.start;
           // Fallback port probing should prefer Flask defaults, not Vite's.
-          isVite = false;
-          hybridMode = true;
+          setPrimaryStack("python-hybrid-vite");
         } else {
+          setPrimaryStack(tentativeNodeStack);
           // For Vite, append --host 0.0.0.0 so it binds to all interfaces.
           // For other Node frameworks, HOST=0.0.0.0 env var handles it.
-          const viteSuffix = isVite ? " -- --host 0.0.0.0" : "";
+          const viteSuffix = hasVite ? " -- --host 0.0.0.0" : "";
           if (scripts.dev) {
             startCmd = "npm run dev" + viteSuffix;
           } else if (scripts.start) {
@@ -845,12 +876,16 @@ app.get(
         installCmd = bashLc(combined + py.install);
         startCmd = pyPrefix ? bashLc(pyPrefix + py.start) : py.start;
         installTimeoutMs = INSTALL_TIMEOUT_MS_PYTHON;
+        setPrimaryStack("python-pure");
       } else if (wantsStack("rust") && (await has("Cargo.toml"))) {
         startCmd = "cargo run";
+        setPrimaryStack("rust");
       } else if (wantsStack("go") && (await has("go.mod"))) {
         startCmd = "go run .";
+        setPrimaryStack("go");
       } else if (wantsStack("static") && (await has("index.html")) && !(await has("package.json"))) {
         startCmd = "python3 -m http.server 3000 --bind 0.0.0.0";
+        setPrimaryStack("static");
       } else {
         if (stackOverride !== "auto") {
           return errorAndEnd(
@@ -1010,7 +1045,7 @@ app.get(
                     });
                     sendPreviewUrl(fixedUrl, { force: true });
                   }
-                } else if (!pickedPath && isVite) {
+                } else if (!pickedPath && getIsVite()) {
                   // Vite returned 404 on its base path AND no other path on
                   // this port responded with anything other than 404. This
                   // is the classic Flask/Django + Vite hybrid signature:
@@ -1066,7 +1101,7 @@ app.get(
       };
 
       const ensureHostRewriteProxy = async (targetPort: number, basePath?: string) => {
-        if (!isVite) return;
+        if (!getIsVite()) return;
 
         const targetHost = sbx.getHost(targetPort);
         const path = normalizeBasePath(basePath);
@@ -1187,7 +1222,7 @@ app.get(
           // rebind to it.
           if (!previewUrl) {
             sendPreview(u.port, u.basePath);
-          } else if (hybridMode && u.port !== 5173) {
+          } else if (getHybridMode() && u.port !== 5173) {
             const currentPort = (() => {
               try {
                 const m = previewUrl.match(/^https:\/\/(\d+)-/);
@@ -1206,7 +1241,7 @@ app.get(
           }
           return;
         }
-        if (previewUrl && !hybridMode) return;
+        if (previewUrl && !getHybridMode()) return;
         for (const rx of portRegexes) {
           const m = data.match(rx);
           if (m) {
@@ -1246,7 +1281,7 @@ app.get(
       // ports every 5s for ~3 min and rebind preview when one starts
       // returning a non-empty body. This complements the log-based detection
       // in handleLine() and the one-shot fallback timer below.
-      if (hybridMode) {
+      if (getHybridMode()) {
         const pyPorts = [5000, 8000, 8080, 3000];
         const pollScript = [
           "set -e",
@@ -1292,19 +1327,19 @@ app.get(
       // optimistically expose the most likely port for the detected stack.
       // In hybrid mode Flask boot can take 60-120s after npm install
       // finishes, so we wait longer before guessing.
-      const fallbackDelay = hybridMode ? PREVIEW_FALLBACK_MS * 2 : PREVIEW_FALLBACK_MS;
+      const fallbackDelay = getHybridMode() ? PREVIEW_FALLBACK_MS * 2 : PREVIEW_FALLBACK_MS;
       setTimeout(() => {
         if (closed) return;
         // In hybrid mode we may have already locked preview to Vite's :5173
         // via the background command; we still want to upgrade to Flask if
         // it's listening. So don't bail on previewUrl when hybrid.
-        if (previewUrl && !hybridMode) return;
+        if (previewUrl && !getHybridMode()) return;
         void (async () => {
           // Order: in hybrid mode probe Flask/Django defaults first; in
           // pure-Vite probe 5173 first; otherwise standard order.
-          const candidates = hybridMode
+          const candidates = getHybridMode()
             ? [5000, 8000, 3000, 8080, 5173]
-            : isVite
+            : getIsVite()
               ? [5173, 3000, 5000, 8000, 8080]
               : [3000, 5000, 5173, 8000, 8080];
           // Content-aware probe: pick the first port that returns a non-empty
@@ -1349,7 +1384,7 @@ app.get(
           }
 
           if (previewUrl) return;
-          const fallbackPort = hybridMode ? 5000 : isVite ? 5173 : 3000;
+          const fallbackPort = getHybridMode() ? 5000 : getIsVite() ? 5173 : 3000;
           sendPreview(fallbackPort);
         })();
       }, fallbackDelay);
