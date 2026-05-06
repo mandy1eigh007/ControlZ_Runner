@@ -6,6 +6,18 @@ type Status =
   | "idle" | "cloning" | "detecting" | "installing"
   | "running" | "error" | "stopped";
 
+type Stack = "auto" | "node" | "python" | "hybrid-py-node" | "static" | "rust" | "go";
+
+const STACK_OPTIONS: { value: Stack; label: string; hint: string }[] = [
+  { value: "auto", label: "Auto", hint: "Detect from repo files" },
+  { value: "node", label: "Node", hint: "package.json (Vite, Next, Express…)" },
+  { value: "python", label: "Python", hint: "requirements.txt / pyproject.toml" },
+  { value: "hybrid-py-node", label: "Hybrid Py+JS", hint: "Flask/Django + Vite asset server" },
+  { value: "static", label: "Static", hint: "index.html only" },
+  { value: "rust", label: "Rust", hint: "cargo run" },
+  { value: "go", label: "Go", hint: "go run ." },
+];
+
 const C = {
   reset: "\x1b[0m",
   red: "\x1b[31m",
@@ -26,6 +38,8 @@ const STATUS_COLORS: Record<Status, string> = {
 export function App() {
   const [url, setUrl] = useState("");
   const [customCommand, setCustomCommand] = useState("");
+  const [stack, setStack] = useState<Stack>("auto");
+  const [envVars, setEnvVars] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [activeSandbox, setActiveSandbox] = useState<string | null>(null);
@@ -152,6 +166,8 @@ export function App() {
         body: JSON.stringify({
           url: url.trim(),
           customCommand: customCommand.trim() || undefined,
+          stack,
+          envs: envVars,
         }),
       });
       if (!res.ok) {
@@ -164,8 +180,9 @@ export function App() {
       const { sandboxId } = (await res.json()) as { sandboxId: string };
       setActiveSandbox(sandboxId);
 
-      const qs = new URLSearchParams({ url, customCommand: customCommand || "" });
-      const es = new EventSource(`/api/run/${sandboxId}/stream?${qs.toString()}`);
+      // /stream looks up url/customCommand/stack/envs from server-side config
+      // keyed on sandboxId; nothing sensitive (env vars) is sent in the URL.
+      const es = new EventSource(`/api/run/${sandboxId}/stream`);
       esRef.current = es;
 
       es.addEventListener("status", (e) => {
@@ -244,11 +261,51 @@ export function App() {
         <summary className="cursor-pointer select-none text-emerald-400/80 hover:text-emerald-200">
           Advanced
         </summary>
-        <div className="mt-2">
-          <input type="text" value={customCommand}
-            onChange={(e) => setCustomCommand(e.target.value)}
-            placeholder="Custom start command (optional)" disabled={running}
-            className="w-full rounded border border-emerald-900/60 bg-neutral-950 px-3 py-2 text-sm font-mono text-emerald-200 placeholder:text-emerald-700 focus:border-emerald-600/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70 focus-visible:ring-offset-2 focus-visible:ring-offset-neutral-950 disabled:opacity-60" />
+        <div className="mt-3 space-y-3">
+          <div>
+            <label className="mb-1 block text-xs uppercase tracking-wide text-emerald-400/70">
+              Stack
+            </label>
+            <div className="flex flex-wrap gap-1.5">
+              {STACK_OPTIONS.map((opt) => (
+                <button
+                  key={opt.value}
+                  type="button"
+                  disabled={running}
+                  onClick={() => setStack(opt.value)}
+                  title={opt.hint}
+                  className={`rounded border px-2.5 py-1 text-xs font-medium transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70 focus-visible:ring-offset-2 focus-visible:ring-offset-neutral-950 disabled:cursor-not-allowed disabled:opacity-50 ${
+                    stack === opt.value
+                      ? "border-emerald-700/60 bg-emerald-900 text-emerald-50"
+                      : "border-emerald-900/60 bg-neutral-950 text-emerald-300 hover:border-emerald-700/60"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <label className="mb-1 block text-xs uppercase tracking-wide text-emerald-400/70">
+              Custom start command
+            </label>
+            <input type="text" value={customCommand}
+              onChange={(e) => setCustomCommand(e.target.value)}
+              placeholder="Overrides detection (e.g. python -u server.py)" disabled={running}
+              className="w-full rounded border border-emerald-900/60 bg-neutral-950 px-3 py-2 text-sm font-mono text-emerald-200 placeholder:text-emerald-700 focus:border-emerald-600/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70 focus-visible:ring-offset-2 focus-visible:ring-offset-neutral-950 disabled:opacity-60" />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs uppercase tracking-wide text-emerald-400/70">
+              Environment variables
+              <span className="ml-2 normal-case text-emerald-700">KEY=VALUE per line, # for comments</span>
+            </label>
+            <textarea value={envVars}
+              onChange={(e) => setEnvVars(e.target.value)}
+              placeholder={"OPENAI_API_KEY=sk-...\nLDR_BOOTSTRAP_ALLOW_UNENCRYPTED=true"}
+              disabled={running} rows={4}
+              spellCheck={false}
+              className="w-full resize-y rounded border border-emerald-900/60 bg-neutral-950 px-3 py-2 text-sm font-mono text-emerald-200 placeholder:text-emerald-700 focus:border-emerald-600/70 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/70 focus-visible:ring-offset-2 focus-visible:ring-offset-neutral-950 disabled:opacity-60" />
+          </div>
         </div>
       </details>
       <div className="px-4 py-2">
@@ -260,10 +317,17 @@ export function App() {
         <div className="bg-neutral-950">
           <div ref={termRef} className="h-full w-full" />
         </div>
-        <div className="bg-neutral-950">
+        <div className="relative bg-neutral-950">
           {previewUrl ? (
-            <iframe src={previewUrl} className="h-full w-full border-0"
-              sandbox="allow-scripts allow-same-origin allow-forms allow-popups" />
+            <>
+              <iframe src={previewUrl} className="h-full w-full border-0"
+                sandbox="allow-scripts allow-same-origin allow-forms allow-popups" />
+              <a href={previewUrl} target="_blank" rel="noopener noreferrer"
+                className="absolute right-3 top-3 rounded border border-emerald-700/60 bg-emerald-900/90 px-2.5 py-1 text-xs font-medium text-emerald-50 shadow hover:bg-emerald-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/80"
+                title="Open in new tab (bypasses iframe restrictions like X-Frame-Options/CSP)">
+                Open ↗
+              </a>
+            </>
           ) : (
             <div className="flex h-full w-full items-center justify-center px-6 text-center text-sm text-emerald-700">
               No preview yet — the app will appear here once a web server starts.

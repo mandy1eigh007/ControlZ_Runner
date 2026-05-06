@@ -4,9 +4,21 @@ import cors from "cors";
 import { Sandbox } from "e2b";
 
 const PORT = 8787;
-const SANDBOX_TIMEOUT_MS = 600_000;
+// Hard sandbox lifetime cap. Long enough to allow heavy Python installs
+// (sqlcipher / cairo / weasyprint can take 10+ minutes on a cold sandbox)
+// while still bounding cost if a user closes the tab.
+const SANDBOX_TIMEOUT_MS = 30 * 60_000;
+// Per-install timeouts. Python is intentionally larger because compiled
+// wheels (numpy, sqlcipher, weasyprint) frequently exceed 5 minutes from
+// a cold sandbox. Node installs are fast (npm registry + prebuilt deps).
+const INSTALL_TIMEOUT_MS_NODE = 5 * 60_000;
+const INSTALL_TIMEOUT_MS_PYTHON = 15 * 60_000;
+// Generic fallback used when stack is unknown or for non-install commands.
 const INSTALL_TIMEOUT_MS = 5 * 60_000;
-const PREVIEW_FALLBACK_MS = 30_000;
+// Wait this long after the start command before optimistically probing
+// common ports. Flask apps with first-boot DB migrations or model loads
+// regularly take >30s.
+const PREVIEW_FALLBACK_MS = 75_000;
 
 const app = express();
 app.use(cors());
@@ -14,6 +26,48 @@ app.use(express.json());
 
 const sandboxes = new Map<string, Sandbox>();
 const sandboxTimers = new Map<string, NodeJS.Timeout>();
+
+// Per-sandbox run config captured at /api/run time. /stream reads from here
+// rather than re-accepting these via query params, which keeps env values
+// (potentially long, potentially sensitive) out of URLs and access logs.
+type Stack = "auto" | "node" | "python" | "static" | "rust" | "go" | "hybrid-py-node";
+const VALID_STACKS: Stack[] = ["auto", "node", "python", "static", "rust", "go", "hybrid-py-node"];
+type RunConfig = {
+  url: string;
+  customCommand: string;
+  stack: Stack;
+  envs: Record<string, string>;
+};
+const runConfigs = new Map<string, RunConfig>();
+
+// Parse a `KEY=VALUE` per-line block from the UI into an env map.
+// - Skips blank lines and `#` comments
+// - Strips surrounding single/double quotes around values
+// - Validates keys against POSIX env var name rules
+// - Caps total entries to avoid DoS
+function parseEnvBlock(raw: unknown): Record<string, string> {
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  const out: Record<string, string> = {};
+  const MAX_ENTRIES = 64;
+  const MAX_VALUE_LEN = 8192;
+  const lines = raw.split(/\r?\n/);
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (value.length > MAX_VALUE_LEN) continue;
+    out[key] = value;
+    if (Object.keys(out).length >= MAX_ENTRIES) break;
+  }
+  return out;
+}
 
 function getNormalizedE2BApiKey(): { ok: true; value: string } | { ok: false; reason: string } {
   const raw = process.env.E2B_API_KEY;
@@ -60,17 +114,25 @@ async function disposeSandbox(sandboxId: string) {
     clearTimeout(timer);
     sandboxTimers.delete(sandboxId);
   }
+  runConfigs.delete(sandboxId);
 }
 
 app.post("/api/run", async (req: Request, res: Response) => {
   try {
-    const { url, customCommand } = req.body as {
+    const { url, customCommand, stack, envs } = req.body as {
       url?: string;
       customCommand?: string;
+      stack?: string;
+      envs?: string;
     };
     if (!url || !isValidGitHubUrl(url)) {
       return res.status(400).json({ error: "Invalid GitHub URL" });
     }
+    const stackChoice: Stack =
+      typeof stack === "string" && (VALID_STACKS as string[]).includes(stack)
+        ? (stack as Stack)
+        : "auto";
+    const parsedEnvs = parseEnvBlock(envs);
     const key = getNormalizedE2BApiKey();
     if (!key.ok) {
       const hint =
@@ -84,6 +146,12 @@ app.post("/api/run", async (req: Request, res: Response) => {
       timeoutMs: SANDBOX_TIMEOUT_MS,
     });
     sandboxes.set(sbx.sandboxId, sbx);
+    runConfigs.set(sbx.sandboxId, {
+      url: normalizeUrl(url),
+      customCommand: (customCommand ?? "").trim(),
+      stack: stackChoice,
+      envs: parsedEnvs,
+    });
 
     // Hard kill timer — fires after 10 min regardless of activity.
     const timer = setTimeout(() => {
@@ -106,8 +174,15 @@ app.get(
       res.status(404).json({ error: "Sandbox not found" });
       return;
     }
-    const url = normalizeUrl(String(req.query.url ?? ""));
-    const customCommand = String(req.query.customCommand ?? "").trim();
+    const cfg = runConfigs.get(sandboxId);
+    if (!cfg) {
+      res.status(404).json({ error: "Run config not found for sandbox" });
+      return;
+    }
+    const url = cfg.url;
+    const customCommand = cfg.customCommand;
+    const stackOverride: Stack = cfg.stack;
+    const userEnvs: Record<string, string> = cfg.envs;
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -216,6 +291,9 @@ app.get(
       let installCmd: string | null = null;
       let startCmd: string | null = null;
       let isVite = false;
+      // Per-install timeout, chosen by the branch that owns the install.
+      // Defaults to the conservative generic value; overridden below.
+      let installTimeoutMs = INSTALL_TIMEOUT_MS;
 
       const shellSingleQuote = (value: string) => {
         // Wrap in single quotes and escape embedded single quotes safely.
@@ -289,9 +367,160 @@ app.get(
         return script + "\n";
       };
 
+      // Parse pyproject.toml's `requires-python` and return the lowest
+      // satisfying X.Y string (e.g. ">=3.12,<3.15" -> "3.12"). Returns null
+      // if absent or unparseable.
+      const parseRequiresPythonMin = (text: string): string | null => {
+        const m = text.match(/requires[-_]python\s*=\s*["']([^"']+)["']/i);
+        if (!m) return null;
+        const spec = m[1];
+        const pick = spec.match(/>=\s*(\d+)\.(\d+)/) || spec.match(/~=\s*(\d+)\.(\d+)/);
+        return pick ? `${pick[1]}.${pick[2]}` : null;
+      };
+
+      const compareVersion = (a: string, b: string) => {
+        const pa = a.split(".").map((n) => Number(n) || 0);
+        const pb = b.split(".").map((n) => Number(n) || 0);
+        for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+          const x = pa[i] || 0;
+          const y = pb[i] || 0;
+          if (x !== y) return x - y;
+        }
+        return 0;
+      };
+
+      // If the repo's pyproject requires a newer Python than the sandbox
+      // ships with, install uv + the requested Python version, create a
+      // venv, and return a shell prefix that activates it. Returns "" if
+      // no upgrade is needed.
+      const ensurePythonEnvPrefix = async (pyMin?: string | null): Promise<string> => {
+        if (!pyMin) return "";
+        const v = await sbx.commands.run(
+          `python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || true`,
+        );
+        const cur = (v.stdout || "").trim();
+        if (cur && compareVersion(cur, pyMin) >= 0) return "";
+
+        send("log", {
+          stream: "status",
+          line: `→ Upgrading Python in sandbox (need >=${pyMin}; found ${cur || "unknown"}). Installing via uv.`,
+        });
+
+        const script = [
+          "set -e",
+          'export HOME="${HOME:-/home/user}"',
+          'export PATH="$HOME/.local/bin:$PATH"',
+          "if ! command -v uv >/dev/null 2>&1; then",
+          "  curl -LsSf https://astral.sh/uv/install.sh | sh",
+          '  export PATH="$HOME/.local/bin:$PATH"',
+          "fi",
+          `pyver="${pyMin}"`,
+          'uv python install "$pyver"',
+          'venv="$HOME/.cache/repo-venv-${pyver}"',
+          'if [ ! -x "$venv/bin/python" ]; then',
+          '  uv venv "$venv" --python "$pyver" --seed',
+          "fi",
+          '. "$venv/bin/activate"',
+          'export VIRTUAL_ENV="$venv"',
+          'export PATH="$venv/bin:$PATH"',
+          "python --version",
+        ].join("\n");
+        return script + "\n";
+      };
+
+      // Detect a Python install + start command pair. Used by both the
+      // pure-Python branch and the hybrid Python+Vite branch.
+      // Resolution order:
+      //   1. streamlit_app.py / app.py / main.py at repo root
+      //   2. pyproject.toml [project.scripts] — pick a "web/serve/app/run"-ish
+      //      script if available, else the first one. After `pip install .`,
+      //      the script is on PATH.
+      const detectPythonStart = async (): Promise<
+        { install: string; start: string; pyMin: string | null } | null
+      > => {
+        let install: string | null = null;
+        if (await has("requirements.txt")) {
+          install = "python -m pip install -r requirements.txt";
+        } else if (await has("pyproject.toml")) {
+          install = "python -m pip install .";
+        } else {
+          return null;
+        }
+
+        let pyMin: string | null = null;
+        if (await has("pyproject.toml")) {
+          try {
+            const text = await sbx.files.read("/home/user/repo/pyproject.toml");
+            pyMin = parseRequiresPythonMin(text);
+          } catch {
+            // ignore — pyMin stays null
+          }
+        }
+
+        if (await has("streamlit_app.py")) {
+          return {
+            install,
+            start:
+              "streamlit run streamlit_app.py --server.port 3000 --server.address 0.0.0.0 --server.headless true",
+            pyMin,
+          };
+        }
+        if (await has("app.py")) return { install, start: "python -u app.py", pyMin };
+        if (await has("main.py")) return { install, start: "python -u main.py", pyMin };
+
+        if (await has("pyproject.toml")) {
+          // Parse [project.scripts] inside the sandbox via Python (tomllib).
+          const pyScript = [
+            "import sys",
+            "try:",
+            "    import tomllib",
+            "except ImportError:",
+            "    import tomli as tomllib  # type: ignore",
+            "with open('/home/user/repo/pyproject.toml', 'rb') as f:",
+            "    d = tomllib.load(f)",
+            "scripts = ((d.get('project') or {}).get('scripts')) or {}",
+            "keys = list(scripts.keys())",
+            "def score(k):",
+            "    kl = k.lower()",
+            "    for w in ('web', 'serve', 'server', 'app', 'run', 'start'):",
+            "        if w in kl: return 0",
+            "    return 1",
+            "keys.sort(key=score)",
+            "print(keys[0] if keys else '')",
+          ].join("\n");
+          try {
+            const r = await sbx.commands.run(
+              `python3 -c ${shellSingleQuote(pyScript)}`,
+            );
+            // Plain `python3 -c` output — no ANSI codes to strip.
+            const name = (r.stdout || "").trim();
+            if (name && /^[A-Za-z0-9._-]+$/.test(name)) {
+              return { install, start: name, pyMin };
+            }
+          } catch {
+            // tomllib unavailable (Python <3.11 with no tomli); fall through.
+          }
+        }
+
+        return null;
+      };
+
+      // Stack override gate: if the user selected a specific stack, only that
+      // branch (and "auto") will match. "hybrid-py-node" is special-cased
+      // inside the Node branch.
+      const wantsStack = (...kinds: Stack[]): boolean =>
+        stackOverride === "auto" || kinds.includes(stackOverride);
+
+      if (stackOverride !== "auto") {
+        send("log", {
+          stream: "status",
+          line: `→ Stack override: ${stackOverride} (auto-detection skipped)`,
+        });
+      }
+
       if (customCommand) {
         startCmd = customCommand;
-      } else if (await has("package.json")) {
+      } else if (wantsStack("node", "hybrid-py-node") && (await has("package.json"))) {
         installCmd = "npm install --no-audit --no-fund --loglevel=error";
         const pkgText = await sbx.files.read("/home/user/repo/package.json");
         let pkg: any = {};
@@ -315,53 +544,139 @@ app.get(
             )
           : "";
 
-        // For Vite, append --host 0.0.0.0 so it binds to all interfaces.
-        // For other Node frameworks, HOST=0.0.0.0 env var handles it.
-        const viteSuffix = isVite ? " -- --host 0.0.0.0" : "";
-        if (scripts.dev) {
-          startCmd = "npm run dev" + viteSuffix;
-        } else if (scripts.start) {
-          startCmd = "npm start";
-        } else if (scripts.serve) {
-          startCmd = "npm run serve" + viteSuffix;
-        } else {
-          return errorAndEnd("package.json has no dev/start/serve script");
+        // Hybrid Python + Vite (e.g. Flask + Vite asset server). Vite alone
+        // serves no index.html in these repos — the Python backend renders
+        // HTML and pulls JS/CSS modules from the Vite dev server. Detect
+        // this case and run Python as the primary preview, with Vite as a
+        // background asset server.
+        // When the user explicitly forced "hybrid-py-node", we always take
+        // this branch even if Vite isn't in deps (covers webpack/parcel/etc.
+        // hybrids — npm run dev still runs whatever the repo configured).
+        const hasPython =
+          (await has("pyproject.toml")) || (await has("requirements.txt"));
+        const forceHybrid = stackOverride === "hybrid-py-node";
+        const hybridPy =
+          (forceHybrid || isVite) && hasPython
+            ? await detectPythonStart()
+            : null;
+        if (forceHybrid && !hybridPy) {
+          return errorAndEnd(
+            "Stack=hybrid-py-node but no Python entry found. Add app.py / main.py / streamlit_app.py at repo root, or define [project.scripts] in pyproject.toml, or use Advanced.",
+          );
         }
 
-        // Ensure both install + start run under the modern Node if we upgraded.
-        if (nodePrefix) {
-          installCmd = bashLc(nodePrefix + installCmd);
-          startCmd = bashLc(nodePrefix + startCmd);
+        if (hybridPy) {
+          send("log", {
+            stream: "status",
+            line: "→ Detected hybrid Python + Vite repo: running Python backend as primary, Vite as background asset server.",
+          });
+
+          status("installing");
+          const npmInstall = bashLc(
+            nodePrefix + "npm install --no-audit --no-fund --loglevel=error",
+          );
+          const ni = await sbx.commands.run(npmInstall, {
+            cwd: "/home/user/repo",
+            onStdout: log("stdout"),
+            onStderr: log("stderr"),
+            timeoutMs: INSTALL_TIMEOUT_MS_NODE,
+          });
+          if (ni.exitCode !== 0) {
+            return errorAndEnd("npm install failed. See logs above.");
+          }
+
+          const pyPrefix = await ensurePythonEnvPrefix(hybridPy.pyMin);
+          const pyInstall = pyPrefix
+            ? bashLc(pyPrefix + hybridPy.install)
+            : hybridPy.install;
+          const pi = await sbx.commands.run(pyInstall, {
+            cwd: "/home/user/repo",
+            onStdout: log("stdout"),
+            onStderr: log("stderr"),
+            timeoutMs: INSTALL_TIMEOUT_MS_PYTHON,
+          });
+          if (pi.exitCode !== 0) {
+            return errorAndEnd(
+              "Python install failed. See logs above. The repo's Python deps may need system libraries not present in the sandbox; try Advanced with a custom command.",
+            );
+          }
+
+          // Start Vite dev server in the background (asset server only).
+          const viteCmd = bashLc(
+            nodePrefix + "npm run dev -- --host 0.0.0.0",
+          );
+          await sbx.commands.run(viteCmd, {
+            background: true,
+            cwd: "/home/user/repo",
+            envs: {
+              HOST: "0.0.0.0",
+              __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: ".e2b.app",
+              __VITE_ADDITIONAL_PREVIEW_ALLOWED_HOSTS: ".e2b.app",
+              ...userEnvs,
+            },
+            onStdout: (d) =>
+              send("log", { stream: "stdout", line: `[vite] ${d}` }),
+            onStderr: (d) =>
+              send("log", { stream: "stderr", line: `[vite] ${d}` }),
+          });
+          send("log", {
+            stream: "status",
+            line: "→ Vite dev server started in background on :5173",
+          });
+
+          // Skip the regular install phase below; primary command is Python.
+          installCmd = null;
+          startCmd = pyPrefix
+            ? bashLc(pyPrefix + hybridPy.start)
+            : hybridPy.start;
+          // Fallback port probing should prefer Flask defaults, not Vite's.
+          isVite = false;
+        } else {
+          // For Vite, append --host 0.0.0.0 so it binds to all interfaces.
+          // For other Node frameworks, HOST=0.0.0.0 env var handles it.
+          const viteSuffix = isVite ? " -- --host 0.0.0.0" : "";
+          if (scripts.dev) {
+            startCmd = "npm run dev" + viteSuffix;
+          } else if (scripts.start) {
+            startCmd = "npm start";
+          } else if (scripts.serve) {
+            startCmd = "npm run serve" + viteSuffix;
+          } else {
+            return errorAndEnd("package.json has no dev/start/serve script");
+          }
+
+          // Ensure both install + start run under the modern Node if we upgraded.
+          if (nodePrefix) {
+            installCmd = bashLc(nodePrefix + installCmd);
+            startCmd = bashLc(nodePrefix + startCmd);
+          }
+          installTimeoutMs = INSTALL_TIMEOUT_MS_NODE;
         }
-      } else if (await has("requirements.txt")) {
-        installCmd = "pip install -r requirements.txt";
-        if (await has("streamlit_app.py"))
-          startCmd =
-            "streamlit run streamlit_app.py --server.port 3000 --server.address 0.0.0.0 --server.headless true";
-        else if (await has("app.py")) startCmd = "python -u app.py";
-        else if (await has("main.py")) startCmd = "python -u main.py";
-        else
+      } else if (wantsStack("python") && ((await has("requirements.txt")) || (await has("pyproject.toml")))) {
+        const py = await detectPythonStart();
+        if (!py) {
           return errorAndEnd(
-            "requirements.txt found but no app.py/main.py/streamlit_app.py",
+            (await has("requirements.txt"))
+              ? "requirements.txt found but no app.py/main.py/streamlit_app.py and no [project.scripts] entry"
+              : "pyproject.toml found but no app.py/main.py/streamlit_app.py and no [project.scripts] entry",
           );
-      } else if (await has("pyproject.toml")) {
-        installCmd = "pip install .";
-        if (await has("streamlit_app.py"))
-          startCmd =
-            "streamlit run streamlit_app.py --server.port 3000 --server.address 0.0.0.0 --server.headless true";
-        else if (await has("app.py")) startCmd = "python -u app.py";
-        else if (await has("main.py")) startCmd = "python -u main.py";
-        else
-          return errorAndEnd(
-            "pyproject.toml found but no app.py/main.py/streamlit_app.py",
-          );
-      } else if (await has("Cargo.toml")) {
+        }
+        const pyPrefix = await ensurePythonEnvPrefix(py.pyMin);
+        installCmd = pyPrefix ? bashLc(pyPrefix + py.install) : py.install;
+        startCmd = pyPrefix ? bashLc(pyPrefix + py.start) : py.start;
+        installTimeoutMs = INSTALL_TIMEOUT_MS_PYTHON;
+      } else if (wantsStack("rust") && (await has("Cargo.toml"))) {
         startCmd = "cargo run";
-      } else if (await has("go.mod")) {
+      } else if (wantsStack("go") && (await has("go.mod"))) {
         startCmd = "go run .";
-      } else if ((await has("index.html")) && !(await has("package.json"))) {
+      } else if (wantsStack("static") && (await has("index.html")) && !(await has("package.json"))) {
         startCmd = "python3 -m http.server 3000 --bind 0.0.0.0";
       } else {
+        if (stackOverride !== "auto") {
+          return errorAndEnd(
+            `Stack=${stackOverride} but no matching project files were found in the repo. Try Auto or Advanced with a custom command.`,
+          );
+        }
         if (await looksDocsOnly()) {
           startCmd = "python3 -m http.server 3000 --bind 0.0.0.0";
         } else {
@@ -376,11 +691,15 @@ app.get(
       // PHASE 3 — install
       if (installCmd) {
         status("installing");
+        send("log", {
+          stream: "status",
+          line: `→ Install timeout: ${Math.round(installTimeoutMs / 60_000)}m`,
+        });
         const ins = await sbx.commands.run(installCmd, {
           cwd: "/home/user/repo",
           onStdout: log("stdout"),
           onStderr: log("stderr"),
-          timeoutMs: INSTALL_TIMEOUT_MS,
+          timeoutMs: installTimeoutMs,
         });
         if (ins.exitCode !== 0) {
           return errorAndEnd("Install failed. See logs above.");
@@ -448,6 +767,60 @@ app.get(
             if (text) {
               for (const line of text.split(/\r?\n/)) {
                 send("log", { stream: "status", line: `→ ${line}` });
+              }
+            }
+
+            // If the detected base path isn't actually served, fall back to a
+            // more likely entry point (usually `/` for Vite dev servers).
+            const statusLine = (text.split(/\r?\n/).find((l) => /^HTTP\//.test(l)) || "").trim();
+            const is404 = /\s404\s/.test(statusLine);
+            if (is404 && safePath !== "/") {
+              const trimmed = safePath.endsWith("/") ? safePath.slice(0, -1) : safePath;
+              const candidates = Array.from(
+                new Set([
+                  safePath,
+                  trimmed,
+                  trimmed ? `${trimmed}/` : "/",
+                  trimmed ? `${trimmed}/index.html` : "/index.html",
+                  "/",
+                  "/index.html",
+                ]),
+              ).filter(Boolean);
+
+              const pickScript = [
+                "set -e",
+                `base=${JSON.stringify(`http://127.0.0.1:${port}`)}`,
+                `for p in ${candidates.map((c) => JSON.stringify(c)).join(" ")}; do` +
+                  " code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 \"$base$p\" || echo 000);" +
+                  " if [ \"$code\" != \"404\" ] && [ \"$code\" != \"000\" ]; then echo $p; exit 0; fi;" +
+                  " done; exit 1",
+              ].join("\n");
+
+              try {
+                const pick = await sbx.commands.run(bashLc(pickScript));
+                const pickedPath = stripAnsi(pick.stdout || "").trim();
+                if (pickedPath && pickedPath !== safePath) {
+                  const fixedUrl = buildPreviewUrl(port, pickedPath);
+                  if (fixedUrl) {
+                    send("log", {
+                      stream: "status",
+                      line: `→ Preview path fallback: ${safePath} returned 404; switching to ${pickedPath}`,
+                    });
+                    sendPreviewUrl(fixedUrl, { force: true });
+                  }
+                } else if (!pickedPath && isVite) {
+                  // Vite returned 404 on its base path AND no other path on
+                  // this port responded with anything other than 404. This
+                  // is the classic Flask/Django + Vite hybrid signature:
+                  // Vite is configured as an asset server only and the
+                  // actual app lives in the Python backend on another port.
+                  send("log", {
+                    stream: "status",
+                    line: `→ Hint: ${safePath} returned 404 and no other path on :${port} responded. This repo may be a Flask/Django + Vite hybrid where Vite only serves JS/CSS modules. Try Advanced with a Python start command (e.g. \`python -m <pkg>.web.app\` or the repo's documented entry).`,
+                  });
+                }
+              } catch {
+                // ignore
               }
             }
           } catch (e: any) {
@@ -617,6 +990,13 @@ app.get(
         }
       };
 
+      if (Object.keys(userEnvs).length > 0) {
+        send("log", {
+          stream: "status",
+          line: `→ Injecting ${Object.keys(userEnvs).length} user env var(s): ${Object.keys(userEnvs).join(", ")}`,
+        });
+      }
+
       await sbx.commands.run(startCmd!, {
         background: true,
         cwd: "/home/user/repo",
@@ -627,6 +1007,7 @@ app.get(
           CI: "true",
           __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: ".e2b.app",
           __VITE_ADDITIONAL_PREVIEW_ALLOWED_HOSTS: ".e2b.app",
+          ...userEnvs,
         },
         onStdout: (data) => handleLine("stdout", data),
         onStderr: (data) => handleLine("stderr", data),
