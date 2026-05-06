@@ -1645,45 +1645,91 @@ app.get(
       // returning a non-empty body. This complements the log-based detection
       // in handleLine() and the one-shot fallback timer below.
       if (getHybridMode()) {
-        const pyPorts = [5000, 8000, 8080, 3000];
+        // Wider port coverage: Flask defaults (5000/5001), Django (8000),
+        // generic dev (3000/4000/8080), Gradio (7860), Streamlit (8501),
+        // Jupyter (8888), and a few uncommon-but-real (5050).
+        const pyPorts = [5000, 5001, 5050, 8000, 8080, 3000, 4000, 7860, 8501, 8888];
+        // Probe in parallel within the sandbox and print the first port
+        // that returns a non-empty body. Also report ports that are at least
+        // listening (TCP open) as a hint while we wait for a body.
         const pollScript = [
           "set -e",
           "command -v curl >/dev/null 2>&1 || exit 0",
+          // First pass: any port returning a body wins.
           `for p in ${pyPorts.join(" ")}; do`,
-          "  body=$(curl -fsS --max-time 3 \"http://127.0.0.1:$p/\" 2>/dev/null | head -c 32 || true)",
-          '  if [ -n "$body" ]; then echo $p; exit 0; fi',
+          "  body=$(curl -fsS --max-time 2 \"http://127.0.0.1:$p/\" 2>/dev/null | head -c 32 || true)",
+          '  if [ -n "$body" ]; then echo "READY $p"; exit 0; fi',
           "done",
+          // Second pass: report any TCP-open ports so the user sees progress.
+          "open=\"\"",
+          `for p in ${pyPorts.join(" ")}; do`,
+          "  (echo > /dev/tcp/127.0.0.1/$p) >/dev/null 2>&1 && open=\"$open $p\"",
+          "done",
+          'if [ -n "$open" ]; then echo "OPEN$open"; fi',
           "exit 0",
         ].join("\n");
 
         const start = Date.now();
         const POLL_MAX_MS = 3 * 60_000;
-        const POLL_INTERVAL_MS = 5_000;
+        const POLL_INTERVAL_MS = 4_000;
+        const HEARTBEAT_MS = 15_000;
+        let lastHeartbeat = 0;
+        let lastOpenSig = "";
         const tick = async () => {
           if (closed) return;
-          if (Date.now() - start > POLL_MAX_MS) return;
+          const elapsed = Date.now() - start;
+          if (elapsed > POLL_MAX_MS) {
+            send("log", {
+              stream: "status",
+              line: `→ Hybrid poller: gave up after ${Math.round(elapsed / 1000)}s without finding a Python backend on [${pyPorts.join(",")}]. If your app uses a non-standard port, set it via the Advanced > Environment variables panel (e.g. PORT=NNNN).`,
+            });
+            return;
+          }
           try {
             const r = await sbx.commands.run(bashLc(pollScript));
-            const found = parseInt((r.stdout || "").trim(), 10);
-            if (!Number.isNaN(found)) {
+            const out = (r.stdout || "").trim();
+            const readyMatch = out.match(/^READY\s+(\d+)/m);
+            if (readyMatch) {
+              const found = Number(readyMatch[1]);
               const cur = previewUrl ? previewUrl.match(/^https:\/\/(\d+)-/) : null;
               const curPort = cur ? Number(cur[1]) : null;
               if (curPort !== found) {
                 send("log", {
                   stream: "status",
-                  line: `→ Hybrid poller: Python backend responding on :${found}; rebinding preview from :${curPort ?? "?"}.`,
+                  line: `→ Hybrid poller: Python backend responding on :${found} after ${Math.round(elapsed / 1000)}s; rebinding preview from :${curPort ?? "?"}.`,
                 });
                 sendPreview(found, undefined, { force: true });
               }
               return;
+            }
+            // No READY yet; emit a heartbeat at most every HEARTBEAT_MS so
+            // the user can see we're still polling and which ports (if any)
+            // are at least TCP-open.
+            if (elapsed - lastHeartbeat >= HEARTBEAT_MS) {
+              lastHeartbeat = elapsed;
+              const openMatch = out.match(/^OPEN\s+(.+)$/m);
+              const openPorts = openMatch ? openMatch[1].trim().split(/\s+/).join(",") : "";
+              const openSig = openPorts;
+              // Only log when content changed OR every 30s anyway.
+              if (openSig !== lastOpenSig || elapsed % 30_000 < HEARTBEAT_MS) {
+                lastOpenSig = openSig;
+                const detail = openPorts
+                  ? `ports listening but not ready: [${openPorts}]`
+                  : `no ports listening yet`;
+                send("log", {
+                  stream: "status",
+                  line: `→ Hybrid poller: still waiting for Python backend (${Math.round(elapsed / 1000)}s elapsed; ${detail}).`,
+                });
+              }
             }
           } catch {
             // ignore — try again on next tick
           }
           setTimeout(() => void tick(), POLL_INTERVAL_MS);
         };
-        // First probe after 10s to give Flask a head start.
-        setTimeout(() => void tick(), 10_000);
+        // First probe after 4s — Flask can start binding very quickly when
+        // there's no model load; waiting 10s just felt like a hang.
+        setTimeout(() => void tick(), 4_000);
       }
 
       // Fallback: if no port detected from logs after PREVIEW_FALLBACK_MS,
@@ -1701,7 +1747,7 @@ app.get(
           // Order: in hybrid mode probe Flask/Django defaults first; in
           // pure-Vite probe 5173 first; otherwise standard order.
           const candidates = getHybridMode()
-            ? [5000, 8000, 3000, 8080, 5173]
+            ? [5000, 5001, 8000, 3000, 4000, 8080, 7860, 8501, 8888, 5050, 5173]
             : getIsVite()
               ? [5173, 3000, 5000, 8000, 8080]
               : [3000, 5000, 5173, 8000, 8080];

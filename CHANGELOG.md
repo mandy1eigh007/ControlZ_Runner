@@ -10,6 +10,30 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P0-FIX-5: visible hybrid backend wait + wider port coverage
+
+Hybrid runs (Python backend + Vite asset server) sometimes left the user
+staring at a blank `:5173` preview for 30-90s with **zero log output** while
+Flask finished booting. From the user's POV it looked like a hang.
+
+**Changes — [server/index.ts](server/index.ts):**
+
+- Hybrid poller port list expanded:
+  `[5000,8000,8080,3000]` → `[5000,5001,5050,8000,8080,3000,4000,7860,8501,8888]`
+  (now covers Flask alt port, Gradio, Streamlit, Jupyter, common dev ports).
+- First probe moved from 10s → 4s; interval 5s → 4s.
+- Poll script now also checks which ports are TCP-open (not yet serving)
+  via `/dev/tcp/127.0.0.1/$p`, so we can show meaningful progress.
+- Heartbeat status line every ~15s while waiting:
+  `→ Hybrid poller: still waiting for Python backend (Ns elapsed; ports
+  listening but not ready: [5000])`. Avoids the "did it crash?" feeling.
+- When the 3-min poll window finally expires, emit a hint pointing at
+  `Advanced > Environment variables` (`PORT=NNNN`) instead of silently
+  giving up.
+- Fallback-timer port list broadened to match the poller.
+
+---
+
 ## 2026-05-06 — P2-14: categorized error messages
 
 Top-level run failures are now categorized with actionable hints.
