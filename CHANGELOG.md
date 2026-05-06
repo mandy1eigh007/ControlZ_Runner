@@ -10,6 +10,21 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P0-FIX-9: capture start-command exit code
+
+P0-FIX-8 diagnostics revealed the truth: at T+30s after `ldr-web` printed
+"News scheduler enabled: True", **no python process exists** and no sockets
+are listening. The start command exited silently — but `background: true`
+discarded the exit code, so we never saw why.
+
+Fix: stage the original `startCmd` to `/tmp/cz-start.sh` (avoids quote
+escaping for multi-line `bash -lc '...'` payloads), then run a tiny wrapper
+that traps the exit and emits `[ControlZ] start command exited rc=$rc after
+${N}s` to stderr (which streams back to the user via `handleLine`).
+
+Generic infrastructure: every "process disappeared" scenario now reports
+exit code + duration. No more invisible deaths.
+
 ## 2026-05-06 — P0-FIX-8: process diagnostics dump on hang
 
 When `ldr-web` (and other socketio.run-based apps) hangs after `create_app()`

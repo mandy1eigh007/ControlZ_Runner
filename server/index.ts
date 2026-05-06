@@ -1700,7 +1700,26 @@ app.get(
         }
       }
 
-      await sbx.commands.run(startCmd!, {
+      // P0-FIX-9: wrap the start command so we always log its exit code +
+      // duration to the user's stream. Without this, `background:true` makes
+      // silent exits (Flask `main()` returning, missing env var crash, etc.)
+      // invisible — the diagnostics dump shows "no process" but never says
+      // *why* the process is gone. Write the original command to a temp
+      // script (avoids quoting hell for multi-line bash -lc payloads), then
+      // exec it from a tiny wrapper that traps the exit.
+      try {
+        await sbx.files.write(
+          "/tmp/cz-start.sh",
+          `#!/usr/bin/env bash\n${startCmd}\n`,
+        );
+      } catch (e: any) {
+        send("log", {
+          stream: "status",
+          line: `→ Could not stage start script (${e?.message ?? e}); running raw.`,
+        });
+      }
+      const wrappedStart = `bash -lc 'chmod +x /tmp/cz-start.sh 2>/dev/null; t0=$SECONDS; /tmp/cz-start.sh; rc=$?; echo "[ControlZ] start command exited rc=$rc after $((SECONDS-t0))s" >&2; exit $rc'`;
+      await sbx.commands.run(wrappedStart, {
         background: true,
         cwd: "/home/user/repo",
         envs: {
