@@ -1200,10 +1200,11 @@ app.get(
               // let the probe script handle the rest.
               "command -v curl >/dev/null 2>&1 || { echo READY; exit 0; }",
               'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do',
-              // On connection errors curl may emit a code and then our
-              // fallback echoes another "000", producing "000\n000". Normalize
-              // to a single line so the READY check is accurate.
-              `  code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 4 ${JSON.stringify(target)} 2>/dev/null || echo 000); code=$(echo "$code" | tail -n 1 | tr -d '\r\n')`,
+              // Curl prints http_code=000 on connection errors *and* exits
+              // non-zero. Do not append a fallback "000" (that yields
+              // "000000" and can be misread as ready). Instead, rely on the
+              // curl exit code and normalize the printed code.
+              `  code=$(curl -sS -o /dev/null -w "%{http_code}\\n" --connect-timeout 1 --max-time 2 ${JSON.stringify(target)} 2>/dev/null); rc=$?; code=$(echo "$code" | tail -n 1 | tr -d '\r\n'); if [ "$rc" -ne 0 ]; then code=000; fi`,
               '  if [ "$code" != "000" ]; then echo READY; exit 0; fi',
               "  sleep 5",
               "done",
@@ -1274,11 +1275,12 @@ app.get(
               ).filter(Boolean);
 
               const pickScript = [
-                "set -e",
+                "set +e",
                 `base=${JSON.stringify(`http://127.0.0.1:${port}`)}`,
                 `for p in ${candidates.map((c) => JSON.stringify(c)).join(" ")}; do` +
-                  " code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 \"$base$p\" 2>/dev/null || echo 000);" +
+                  " code=$(curl -sS -o /dev/null -w '%{http_code}\\n' --connect-timeout 1 --max-time 2 \"$base$p\" 2>/dev/null); rc=$?;" +
                   " code=$(echo \"$code\" | tail -n 1 | tr -d '\\r\\n');" +
+                  " if [ \"$rc\" -ne 0 ]; then code=000; fi;" +
                   " if [ \"$code\" != \"404\" ] && [ \"$code\" != \"000\" ]; then echo $p; exit 0; fi;" +
                   " done; exit 1",
               ].join("\n");

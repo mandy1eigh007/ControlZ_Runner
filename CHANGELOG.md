@@ -44,9 +44,10 @@ Preview diagnostics are now best-effort (no hard failure) to avoid confusing
 This includes the initial “wait for port to respond” step, which now fails
 softly and logs `skipping probe` instead of surfacing an exception.
 
-The readiness check also now normalizes curl’s `%{http_code}` output to avoid
-false-positives on connection errors (which can otherwise look “ready” and
-trigger an early probe).
+The readiness check also now handles curl connection failures correctly: curl
+prints `000` for `%{http_code}` on connection errors, and the previous fallback
+could accidentally append another `000` (yielding `000000`) and trigger an
+early probe.
 
 ---
 
