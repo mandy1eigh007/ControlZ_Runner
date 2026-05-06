@@ -49,9 +49,14 @@ prints `000` for `%{http_code}` on connection errors, and the previous fallback
 could accidentally append another `000` (yielding `000000`) and trigger an
 early probe.
 
-Finally, in hybrid mode we now avoid letting later Vite log URLs overwrite the
-already-chosen preview path for `:5173`, which could otherwise cause the tab
-URL to “flip” between `/static/` and `/` depending on log order.
+Finally, hybrid Vite previews are now more stable and less noisy:
+
+- We seed `:5173` to `/` by default (many hybrids log `/static/` but serve the
+  HTML entry at `/`).
+- Diagnostics now tries to pick a working path before printing the full
+  status+headers/body block, so you don’t see a guaranteed-404 probe first.
+- Later Vite log URLs won’t overwrite the already-chosen `:5173` preview path,
+  avoiding flip-flops between `/static/` and `/` depending on log order.
 
 ---
 

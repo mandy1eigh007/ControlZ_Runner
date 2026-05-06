@@ -1184,8 +1184,8 @@ app.get(
         previewDiagnosed = true;
 
         const path = normalizeBasePath(basePath) || "/";
-        const safePath = path.startsWith("/") ? path : `/${path}`;
-        const target = `http://127.0.0.1:${port}${safePath}`;
+        let safePath = path.startsWith("/") ? path : `/${path}`;
+        let target = `http://127.0.0.1:${port}${safePath}`;
 
         void (async () => {
           try {
@@ -1228,6 +1228,81 @@ app.get(
                 line: `→ Preview diagnostics: ${target} did not respond within 60s; skipping probe.`,
               });
               return;
+            }
+
+            // For some hybrid repos (notably Vite asset servers), the first
+            // advertised base path may return 404 even though another entry
+            // point on the same port works. If we can cheaply find a better
+            // path, do it before printing probe output.
+            const shouldTryPathPick = (() => {
+              if (safePath !== "/") return true;
+              return getHybridMode() && port === 5173;
+            })();
+
+            if (shouldTryPathPick) {
+              const statusScript = [
+                "set +e",
+                "command -v curl >/dev/null 2>&1 || exit 0",
+                `code=$(curl -sS -o /dev/null -w '%{http_code}\\n' --connect-timeout 1 --max-time 2 ${JSON.stringify(
+                  target,
+                )} 2>/dev/null); rc=$?; code=$(echo "$code" | tail -n 1 | tr -d '\\r\\n'); if [ "$rc" -ne 0 ]; then code=000; fi; echo $code`,
+              ].join("\n");
+              try {
+                const r = await sbx.commands.run(bashLc(statusScript));
+                const code = stripAnsi(r.stdout || "").trim();
+                if (code === "404") {
+                  const trimmed = safePath.endsWith("/") ? safePath.slice(0, -1) : safePath;
+                  const candidates = (() => {
+                    if (getHybridMode() && port === 5173) {
+                      return ["/", "/index.html", "/static/", "/static/index.html"];
+                    }
+                    return Array.from(
+                      new Set([
+                        safePath,
+                        trimmed,
+                        trimmed ? `${trimmed}/` : "/",
+                        trimmed ? `${trimmed}/index.html` : "/index.html",
+                        "/",
+                        "/index.html",
+                      ]),
+                    ).filter(Boolean);
+                  })();
+
+                  const pickScript = [
+                    "set +e",
+                    `base=${JSON.stringify(`http://127.0.0.1:${port}`)}`,
+                    `for p in ${candidates.map((c) => JSON.stringify(c)).join(" ")}; do` +
+                      " code=$(curl -sS -o /dev/null -w '%{http_code}\\n' --connect-timeout 1 --max-time 2 \"$base$p\" 2>/dev/null); rc=$?;" +
+                      " code=$(echo \"$code\" | tail -n 1 | tr -d '\\r\\n');" +
+                      " if [ \"$rc\" -ne 0 ]; then code=000; fi;" +
+                      " if [ \"$code\" != \"404\" ] && [ \"$code\" != \"000\" ]; then echo $p; exit 0; fi;" +
+                      " done; exit 1",
+                  ].join("\n");
+
+                  try {
+                    const pick = await sbx.commands.run(bashLc(pickScript));
+                    const pickedPath = stripAnsi(pick.stdout || "").trim();
+                    if (pickedPath && pickedPath !== safePath) {
+                      const fixedUrl = buildPreviewUrl(port, pickedPath);
+                      if (fixedUrl) {
+                        send("log", {
+                          stream: "status",
+                          line: `→ Preview path fallback: ${safePath} returned 404; switching to ${pickedPath}`,
+                        });
+                        // Keep multi-preview options in sync with the corrected basePath.
+                        registerPreviewOption(port, pickedPath);
+                        sendPreviewUrl(fixedUrl, { force: true, port, basePath: pickedPath });
+                        safePath = pickedPath;
+                        target = `http://127.0.0.1:${port}${safePath}`;
+                      }
+                    }
+                  } catch {
+                    // ignore
+                  }
+                }
+              } catch {
+                // ignore
+              }
             }
 
             send("log", {
@@ -1274,16 +1349,16 @@ app.get(
                 ]),
               ).filter(Boolean);
 
-              const pickScript = [
-                "set +e",
-                `base=${JSON.stringify(`http://127.0.0.1:${port}`)}`,
-                `for p in ${candidates.map((c) => JSON.stringify(c)).join(" ")}; do` +
-                  " code=$(curl -sS -o /dev/null -w '%{http_code}\\n' --connect-timeout 1 --max-time 2 \"$base$p\" 2>/dev/null); rc=$?;" +
-                  " code=$(echo \"$code\" | tail -n 1 | tr -d '\\r\\n');" +
-                  " if [ \"$rc\" -ne 0 ]; then code=000; fi;" +
-                  " if [ \"$code\" != \"404\" ] && [ \"$code\" != \"000\" ]; then echo $p; exit 0; fi;" +
-                  " done; exit 1",
-              ].join("\n");
+                const pickScript = [
+                  "set +e",
+                  `base=${JSON.stringify(`http://127.0.0.1:${port}`)}`,
+                  `for p in ${candidates.map((c) => JSON.stringify(c)).join(" ")}; do` +
+                    " code=$(curl -sS -o /dev/null -w '%{http_code}\\n' --connect-timeout 1 --max-time 2 \"$base$p\" 2>/dev/null); rc=$?;" +
+                    " code=$(echo \"$code\" | tail -n 1 | tr -d '\\r\\n');" +
+                    " if [ \"$rc\" -ne 0 ]; then code=000; fi;" +
+                    " if [ \"$code\" != \"404\" ] && [ \"$code\" != \"000\" ]; then echo $p; exit 0; fi;" +
+                    " done; exit 1",
+                ].join("\n");
 
               try {
                 const pick = await sbx.commands.run(bashLc(pickScript));
@@ -1295,7 +1370,9 @@ app.get(
                       stream: "status",
                       line: `→ Preview path fallback: ${safePath} returned 404; switching to ${pickedPath}`,
                     });
-                    sendPreviewUrl(fixedUrl, { force: true, port });
+                      // Keep multi-preview options in sync with the corrected basePath.
+                      registerPreviewOption(port, pickedPath);
+                      sendPreviewUrl(fixedUrl, { force: true, port, basePath: pickedPath });
                   }
                 } else if (!pickedPath && getIsVite()) {
                   // Vite returned 404 on its base path AND no other path on
@@ -1321,7 +1398,7 @@ app.get(
         })();
       };
 
-      const sendPreviewUrl = (url: string, opts?: { force?: boolean; port?: number }) => {
+      const sendPreviewUrl = (url: string, opts?: { force?: boolean; port?: number; basePath?: string }) => {
         if (closed) return;
         if (!opts?.force && previewUrl) return;
         if (previewUrl === url) return;
@@ -1332,7 +1409,7 @@ app.get(
         send("log", { stream: "status", line: `→ Preview: ${url}` });
         // Keep the multi-preview list in sync with whatever we selected as primary.
         if (typeof opts?.port === "number") {
-          registerPreviewOption(opts.port);
+          registerPreviewOption(opts.port, opts.basePath);
         }
         emitPreviews();
       };
@@ -1535,13 +1612,13 @@ app.get(
       // Register the Vite port up-front so the UI can render a tab even
       // before the backend port is discovered.
       if (getHybridMode()) {
-        // LDR and similar hybrids typically mount Vite under /static/.
-        // We seed the preview to Vite early so the user sees *something*
-        // while the Python backend warms up; the hybrid poller will rebind
-        // to the backend as soon as it starts responding.
-        registerPreviewOption(5173, "/static/", "Vite");
+        // Seed the preview to Vite early so the user sees *something* while
+        // the Python backend warms up; the hybrid poller will rebind to the
+        // backend as soon as it starts responding. In practice, many Vite
+        // setups log a base like `/static/` but serve the HTML entry at `/`.
+        registerPreviewOption(5173, "/", "Vite");
         if (!previewUrl) {
-          sendPreview(5173, "/static/");
+          sendPreview(5173, "/");
         }
       }
 
