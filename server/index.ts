@@ -1476,9 +1476,24 @@ app.get(
 
         const u = extractUrlFromLine(data);
         if (u) {
+          const currentPort = (() => {
+            if (!previewUrl) return null;
+            try {
+              const m = previewUrl.match(/^https:\/\/(\d+)-/);
+              return m ? Number(m[1]) : null;
+            } catch {
+              return null;
+            }
+          })();
           // Record every discovered local URL as a preview option so the UI
           // can offer tabs (especially useful for hybrid Python+Vite repos).
-          registerPreviewOption(u.port, u.basePath);
+          // Hybrid note: the Vite dev server often logs a URL with a base path
+          // like `/static/`, but that doesn't necessarily mean the HTML entry
+          // is served there. Once we've chosen a working path for :5173 (via
+          // seeding/diagnostics), don't let later log lines overwrite it.
+          if (!(getHybridMode() && u.port === 5173 && currentPort === 5173 && previewOptions.has(5173))) {
+            registerPreviewOption(u.port, u.basePath);
+          }
           // In hybrid mode, the Vite asset server may publish its URL first
           // (5173) but the actual app lives on Flask/Django's port. If we've
           // already locked preview but a new, non-Vite local URL appears,
@@ -1486,14 +1501,6 @@ app.get(
           if (!previewUrl) {
             sendPreview(u.port, u.basePath);
           } else if (getHybridMode() && u.port !== 5173) {
-            const currentPort = (() => {
-              try {
-                const m = previewUrl.match(/^https:\/\/(\d+)-/);
-                return m ? Number(m[1]) : null;
-              } catch {
-                return null;
-              }
-            })();
             if (currentPort !== u.port) {
               send("log", {
                 stream: "status",
