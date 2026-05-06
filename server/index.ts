@@ -964,8 +964,42 @@ app.get(
         if (hybridPy) {
           send("log", {
             stream: "status",
-            line: "→ Detected hybrid Python + Vite repo: running Python backend as primary, Vite as background asset server.",
+            line: "→ Detected hybrid Python + Vite repo.",
           });
+
+          // ────────────────────────────────────────────────────────────
+          // Strategy: prefer `npm run build` over `npm run dev`.
+          //
+          // Why: in dev mode Flask serves HTML on :5000 with `<script
+          // src="/static/...">` tags that point at Vite's :5173. In a
+          // browser-on-localhost setup that's same-origin (both localhost),
+          // but in an e2b sandbox each port is a *different* https hostname
+          // (`5000-<id>.e2b.app` vs `5173-<id>.e2b.app`), so the iframe
+          // either CORS-blocks or 404s every asset request. No amount of
+          // port-detection cleverness solves a cross-origin problem.
+          //
+          // The fix is structural: build the Vite assets once into the
+          // static directory the Flask app serves, then run Flask alone.
+          // One origin, one port, one iframe URL — no proxy needed.
+          //
+          // We fall back to dev-mode (the previous behavior) only when:
+          //   - no `build` script exists in package.json, OR
+          //   - the build fails (we report the error and continue with
+          //     dev mode so the user at least sees Flask's HTML).
+          // ────────────────────────────────────────────────────────────
+          const hasBuildScript = typeof scripts.build === "string" && scripts.build.length > 0;
+          const useBuildMode = hasBuildScript;
+          if (useBuildMode) {
+            send("log", {
+              stream: "status",
+              line: `→ Build-mode hybrid: will run \`npm run build\` once, then Flask alone (avoids cross-origin asset issue).`,
+            });
+          } else {
+            send("log", {
+              stream: "status",
+              line: "→ No `build` script in package.json; falling back to dev-mode (Vite + Flask side-by-side).",
+            });
+          }
 
           status("installing");
           const npmInstall = bashLc(
@@ -983,8 +1017,6 @@ app.get(
 
           const pyPrefix = await ensurePythonEnvPrefix(hybridPy.pyMin);
           const mlPrefix = await detectHeavyMlDeps();
-          // Always wrap with bashLc so PIP_SHIM_PREFIX (which defines
-          // `pip_install`) is in scope for hybridPy.install.
           const pyInstall = bashLc(
             (pyPrefix || "") + PIP_SHIM_PREFIX + (mlPrefix || "") + hybridPy.install,
           );
@@ -1000,36 +1032,82 @@ app.get(
             );
           }
 
-          // Start Vite dev server in the background (asset server only).
-          const viteCmd = bashLc(
-            nodePrefix + "npm run dev -- --host 0.0.0.0",
-          );
-          await sbx.commands.run(viteCmd, {
-            background: true,
-            cwd: "/home/user/repo",
-            envs: {
-              HOST: "0.0.0.0",
-              __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: ".e2b.app",
-              __VITE_ADDITIONAL_PREVIEW_ALLOWED_HOSTS: ".e2b.app",
-              ...userEnvs,
-            },
-            onStdout: (d) =>
-              send("log", { stream: "stdout", line: `[vite] ${d}` }),
-            onStderr: (d) =>
-              send("log", { stream: "stderr", line: `[vite] ${d}` }),
-          });
-          send("log", {
-            stream: "status",
-            line: "→ Vite dev server started in background on :5173",
-          });
+          let buildSucceeded = false;
+          if (useBuildMode) {
+            send("log", {
+              stream: "status",
+              line: "→ Running `npm run build` (one-time asset build)…",
+            });
+            const buildCmd = bashLc(nodePrefix + "npm run build --silent");
+            const buildResult = await sbx.commands.run(buildCmd, {
+              cwd: "/home/user/repo",
+              onStdout: (d) =>
+                send("log", { stream: "stdout", line: `[build] ${d}` }),
+              onStderr: (d) =>
+                send("log", { stream: "stderr", line: `[build] ${d}` }),
+              timeoutMs: INSTALL_TIMEOUT_MS_NODE,
+            });
+            buildSucceeded = buildResult.exitCode === 0;
+            if (!buildSucceeded) {
+              send("log", {
+                stream: "status",
+                line: "→ `npm run build` failed; falling back to dev-mode (Vite + Flask).",
+              });
+            } else {
+              send("log", {
+                stream: "status",
+                line: "→ Vite build complete; Flask will serve the bundled assets.",
+              });
+            }
+          }
+
+          // If build mode worked, do NOT start Vite — Flask serves the
+          // built static files itself. If build mode is unavailable or
+          // failed, fall back to the previous dev-mode behavior.
+          if (!buildSucceeded) {
+            const viteCmd = bashLc(
+              nodePrefix + "npm run dev -- --host 0.0.0.0",
+            );
+            await sbx.commands.run(viteCmd, {
+              background: true,
+              cwd: "/home/user/repo",
+              envs: {
+                HOST: "0.0.0.0",
+                __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: ".e2b.app",
+                __VITE_ADDITIONAL_PREVIEW_ALLOWED_HOSTS: ".e2b.app",
+                ...userEnvs,
+              },
+              onStdout: (d) =>
+                send("log", { stream: "stdout", line: `[vite] ${d}` }),
+              onStderr: (d) =>
+                send("log", { stream: "stderr", line: `[vite] ${d}` }),
+            });
+            send("log", {
+              stream: "status",
+              line: "→ Vite dev server started in background on :5173",
+            });
+          }
 
           // Skip the regular install phase below; primary command is Python.
           installCmd = null;
           startCmd = pyPrefix
             ? bashLc(pyPrefix + hybridPy.start)
             : hybridPy.start;
-          // Fallback port probing should prefer Flask defaults, not Vite's.
-          setPrimaryStack("python-hybrid-vite");
+          // Mark the stack accordingly so downstream port-probing/preview
+          // logic knows whether it's looking for one (build mode) or two
+          // (dev mode) services.
+          if (buildSucceeded) {
+            // Build-mode: Flask serves everything. Treat as pure Python so
+            // we don't seed Vite as a preview tab or run the hybrid poller
+            // in dual-port mode.
+            setPrimaryStack("python-pure");
+            send("log", {
+              stream: "status",
+              line: "→ Running Flask as the single preview target (build-mode hybrid).",
+            });
+          } else {
+            setPrimaryStack("python-hybrid-vite");
+          }
         } else {
           setPrimaryStack(tentativeNodeStack);
           // For Vite, append --host 0.0.0.0 so it binds to all interfaces.

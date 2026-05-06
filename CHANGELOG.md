@@ -10,6 +10,41 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P0-FIX-6: prefer `npm run build` for hybrid Python+Vite
+
+After five rounds of patches (P0-FIX..P0-FIX-5) trying to make Vite-dev +
+Flask reach the iframe, we finally diagnosed the **structural** problem:
+in dev mode Flask serves HTML on `:5000` containing `<script src="/static/...">`
+tags pointing at Vite's `:5173`. In an e2b sandbox each port is a separate
+`*.e2b.app` hostname, so every asset request inside the iframe is
+**cross-origin** — CORS-blocks or 404s, regardless of which port we pick
+or how cleverly we poll. No port-detection trick fixes a same-origin
+violation.
+
+**Fix:** when the hybrid repo has a `build` script, run it once and let
+Flask serve the bundled assets itself. One origin, one port, one iframe
+URL — no proxy, no port hunt, no diagnostics noise.
+
+**Changes — [server/index.ts](server/index.ts):**
+
+- New build-mode hybrid path inside the existing hybrid Python+Vite branch:
+  1. `npm install`
+  2. `<python install>` (existing)
+  3. `npm run build --silent` (one-shot; failures are non-fatal)
+  4. Skip starting Vite background; start the Python entry alone
+  5. Mark stack as `python-pure` so the hybrid poller / dual-port preview
+     UI don't kick in (we now have a single preview target).
+- Falls back to the previous dev-mode behavior automatically when:
+  - no `build` script exists in package.json, OR
+  - the build fails (logged with `→ \`npm run build\` failed; falling
+    back to dev-mode`).
+
+This should make LDR (and the ~80% of Flask/Django+Vite repos that follow
+the standard build-then-serve pattern) work end-to-end without further
+tweaks.
+
+---
+
 ## 2026-05-06 — P0-FIX-5: visible hybrid backend wait + wider port coverage
 
 Hybrid runs (Python backend + Vite asset server) sometimes left the user
