@@ -10,6 +10,26 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P0-FIX-7: extend backend poller to all Python stacks
+
+After P0-FIX-6 made build-mode hybrids run as `python-pure`, we lost the
+heartbeat poller (which was gated on `getHybridMode()`). LDR's `loguru`
+backend never logs a parseable "Running on http://" line, so we'd sit in
+silence for the full 75s fallback window with no preview.
+
+**Changes — [server/index.ts](server/index.ts):**
+
+- Backend poller now runs for `python-pure` AND `python-hybrid-vite`
+  (previously hybrid-only). Renamed user-facing prefix from
+  "Hybrid poller" → "Backend poller" since it's no longer hybrid-only.
+- Same heartbeat / LOCAL_ONLY / external-IP probe behavior as before.
+
+This means LDR-style apps (and any Flask/Django/Streamlit/Gradio that
+suppresses startup banners) will now have their port detected actively
+within 4-8s of the start command instead of waiting for the 75s fallback.
+
+---
+
 ## 2026-05-06 — P0-FIX-6: prefer `npm run build` for hybrid Python+Vite
 
 After five rounds of patches (P0-FIX..P0-FIX-5) trying to make Vite-dev +

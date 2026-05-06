@@ -1719,10 +1719,15 @@ app.get(
       // Hybrid mode: many Flask/Django apps don't log a parseable
       // "Running on http://..." line (e.g. socketio.run, gunicorn workers,
       // custom loggers via loguru). Actively poll the typical Python web
-      // ports every 5s for ~3 min and rebind preview when one starts
+      // ports every ~4s for ~3 min and rebind preview when one starts
       // returning a non-empty body. This complements the log-based detection
       // in handleLine() and the one-shot fallback timer below.
-      if (getHybridMode()) {
+      // Runs for any Python stack (pure or hybrid) since the loguru/no-log
+      // pattern is common in both.
+      const isPythonStack =
+        (primaryStack as PrimaryStack) === "python-pure" ||
+        (primaryStack as PrimaryStack) === "python-hybrid-vite";
+      if (isPythonStack) {
         // Wider port coverage: Flask defaults (5000/5001), Django (8000),
         // generic dev (3000/4000/8080), Gradio (7860), Streamlit (8501),
         // Jupyter (8888), and a few uncommon-but-real (5050).
@@ -1770,7 +1775,7 @@ app.get(
         let firstTick = true;
         send("log", {
           stream: "status",
-          line: `→ Hybrid poller: watching ports [${pyPorts.join(",")}] for Python backend (will rebind preview when one responds).`,
+          line: `→ Backend poller: watching ports [${pyPorts.join(",")}] for Python backend (will rebind preview when one responds).`,
         });
         const tick = async () => {
           if (closed) return;
@@ -1778,7 +1783,7 @@ app.get(
           if (elapsed > POLL_MAX_MS) {
             send("log", {
               stream: "status",
-              line: `→ Hybrid poller: gave up after ${Math.round(elapsed / 1000)}s without finding a Python backend on [${pyPorts.join(",")}]. If your app uses a non-standard port, set it via the Advanced > Environment variables panel (e.g. PORT=NNNN).`,
+              line: `→ Backend poller: gave up after ${Math.round(elapsed / 1000)}s without finding a Python backend on [${pyPorts.join(",")}]. If your app uses a non-standard port, set it via the Advanced > Environment variables panel (e.g. PORT=NNNN).`,
             });
             return;
           }
@@ -1793,7 +1798,7 @@ app.get(
               if (curPort !== found) {
                 send("log", {
                   stream: "status",
-                  line: `→ Hybrid poller: Python backend responding on :${found} after ${Math.round(elapsed / 1000)}s; rebinding preview from :${curPort ?? "?"}.`,
+                  line: `→ Backend poller: Python backend responding on :${found} after ${Math.round(elapsed / 1000)}s; rebinding preview from :${curPort ?? "?"}.`,
                 });
                 sendPreview(found, undefined, { force: true });
               }
@@ -1812,7 +1817,7 @@ app.get(
                 lastHeartbeat = elapsed;
                 send("log", {
                   stream: "status",
-                  line: `→ Hybrid poller: Python backend listening on 127.0.0.1:${lp} but NOT on the container's external IP — the iframe preview cannot reach it. Set HOST=0.0.0.0 (and an app-specific equivalent like LDR_HOST=0.0.0.0 / FLASK_RUN_HOST=0.0.0.0) in Advanced > Environment variables, then re-run.`,
+                  line: `→ Backend poller: Python backend listening on 127.0.0.1:${lp} but NOT on the container's external IP — the iframe preview cannot reach it. Set HOST=0.0.0.0 (and an app-specific equivalent like LDR_HOST=0.0.0.0 / FLASK_RUN_HOST=0.0.0.0) in Advanced > Environment variables, then re-run.`,
                 });
               }
               setTimeout(() => void tick(), POLL_INTERVAL_MS);
@@ -1834,7 +1839,7 @@ app.get(
                   : `no ports listening yet`;
                 send("log", {
                   stream: "status",
-                  line: `→ Hybrid poller: still waiting for Python backend (${Math.round(elapsed / 1000)}s elapsed; ${detail}).`,
+                  line: `→ Backend poller: still waiting for Python backend (${Math.round(elapsed / 1000)}s elapsed; ${detail}).`,
                 });
               }
             }
