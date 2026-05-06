@@ -385,9 +385,28 @@ app.get(
         | "go"
         | "custom";
       let primaryStack: PrimaryStack = "unknown";
+      // Short human-friendly labels for the UI status pill. Keep these
+      // stable: they're shown verbatim to users.
+      const stackLabel = (s: PrimaryStack): string => {
+        switch (s) {
+          case "node-vite": return "Vite";
+          case "node-other": return "Node";
+          case "python-pure": return "Python";
+          case "python-hybrid-vite": return "Python + Vite";
+          case "static": return "Static";
+          case "rust": return "Rust";
+          case "go": return "Go";
+          case "custom": return "Custom";
+          default: return "Detecting…";
+        }
+      };
       const setPrimaryStack = (s: PrimaryStack) => {
         primaryStack = s;
         send("log", { stream: "status", line: `→ Primary stack: ${s}` });
+        // Typed event so the UI can render a status pill without parsing
+        // free-form log text. Includes the stable enum value plus a short
+        // human label.
+        send("stack", { stack: s, label: stackLabel(s) });
       };
       // Backward-compatible derived view: `isVite` means "the primary preview
       // we expect on :5173 is Vite". Hybrid mode flips this off because the
@@ -1069,12 +1088,13 @@ app.get(
         })();
       };
 
-      const sendPreviewUrl = (url: string, opts?: { force?: boolean }) => {
+      const sendPreviewUrl = (url: string, opts?: { force?: boolean; port?: number }) => {
         if (closed) return;
         if (!opts?.force && previewUrl) return;
         if (previewUrl === url) return;
         previewUrl = url;
-        send("preview", { url });
+        // Include port (when known) so the UI can show "Vite · :5173" pill.
+        send("preview", { url, port: opts?.port ?? null });
         send("log", { stream: "status", line: `→ Preview: ${url}` });
       };
 
@@ -1201,7 +1221,7 @@ app.get(
       const sendPreview = (port: number, basePath?: string, opts?: { force?: boolean }) => {
         const url = buildPreviewUrl(port, basePath);
         if (!url) return;
-        sendPreviewUrl(url, opts);
+        sendPreviewUrl(url, { ...opts, port });
         // Reset the diagnostics latch when we force a rebind so we re-probe
         // the new port.
         if (opts?.force) previewDiagnosed = false;

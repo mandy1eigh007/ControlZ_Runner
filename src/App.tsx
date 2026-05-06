@@ -42,6 +42,8 @@ export function App() {
   const [envVars, setEnvVars] = useState("");
   const [status, setStatus] = useState<Status>("idle");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewPort, setPreviewPort] = useState<number | null>(null);
+  const [detectedStack, setDetectedStack] = useState<string | null>(null);
   const [activeSandbox, setActiveSandbox] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
 
@@ -158,6 +160,8 @@ export function App() {
     setStarting(true);
     setStatus("idle");
     setPreviewUrl(null);
+    setPreviewPort(null);
+    setDetectedStack(null);
     terminalRef.current?.clear();
     try {
       const res = await fetch("/api/run", {
@@ -196,8 +200,15 @@ export function App() {
         writeln(line, color);
       });
       es.addEventListener("preview", (e) => {
-        const { url: u } = JSON.parse((e as MessageEvent).data) as { url: string };
+        const { url: u, port } = JSON.parse((e as MessageEvent).data) as
+          { url: string; port?: number | null };
         setPreviewUrl(u);
+        if (typeof port === "number") setPreviewPort(port);
+      });
+      es.addEventListener("stack", (e) => {
+        const { label } = JSON.parse((e as MessageEvent).data) as
+          { stack: string; label: string };
+        setDetectedStack(label);
       });
       // SSE 'error' fires for BOTH server-sent named errors AND transport
       // blips. Only act on real server errors (have .data); let transport
@@ -308,10 +319,26 @@ export function App() {
           </div>
         </div>
       </details>
-      <div className="px-4 py-2">
+      <div className="flex flex-wrap items-center gap-2 px-4 py-2">
         <span className={`inline-block rounded-full px-3 py-1 text-xs font-medium ${STATUS_COLORS[status]}`}>
           {status}
         </span>
+        {detectedStack && (
+          <span
+            title="Detected primary stack"
+            className="inline-block rounded-full border border-emerald-700/60 bg-emerald-950/60 px-3 py-1 text-xs font-medium text-emerald-300"
+          >
+            {detectedStack}
+          </span>
+        )}
+        {previewPort != null && (
+          <span
+            title="Preview port inside sandbox"
+            className="inline-block rounded-full border border-emerald-700/60 bg-emerald-950/60 px-3 py-1 text-xs font-medium text-emerald-300"
+          >
+            :{previewPort}
+          </span>
+        )}
       </div>
       <div className="grid min-h-0 flex-1 grid-cols-2 gap-px bg-emerald-950">
         <div className="bg-neutral-950">

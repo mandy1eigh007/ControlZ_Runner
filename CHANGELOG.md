@@ -10,6 +10,20 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P2-10: status pill shows detected stack + preview port
+
+Server now emits a typed `stack` SSE event from `setPrimaryStack()` carrying
+both the stable enum value and a short human label (e.g. `"Python + Vite"`,
+`"Vite"`, `"Python"`). The existing `preview` event payload now also includes
+the bound port (`{ url, port }`).
+
+`App.tsx` listens for both, stores `detectedStack` and `previewPort` state,
+and renders two new emerald-bordered pills alongside the existing status
+pill: `[detecting] [Python + Vite] [:5000]`. Pills are hidden until the
+relevant signal arrives, so the layout doesn't flicker for non-web stacks.
+
+---
+
 ## 2026-05-06 — P1-9: refactor isVite/hybridMode mutation into primaryStack enum
 
 Replaced the two-boolean (`isVite`, `hybridMode`) state machine, which had to
