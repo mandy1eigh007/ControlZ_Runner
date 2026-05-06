@@ -291,6 +291,12 @@ app.get(
       let installCmd: string | null = null;
       let startCmd: string | null = null;
       let isVite = false;
+      // True for Flask/Django + Vite hybrid repos. Vite is asset-only and
+      // the Python backend serves the actual HTML on a different port
+      // (commonly 5000 for Flask, 8000 for Django). Affects fallback port
+      // probing and lets us rebind preview when Flask logs its real port
+      // after the initial Vite-driven detection.
+      let hybridMode = false;
       // Per-install timeout, chosen by the branch that owns the install.
       // Defaults to the conservative generic value; overridden below.
       let installTimeoutMs = INSTALL_TIMEOUT_MS;
@@ -631,6 +637,7 @@ app.get(
             : hybridPy.start;
           // Fallback port probing should prefer Flask defaults, not Vite's.
           isVite = false;
+          hybridMode = true;
         } else {
           // For Vite, append --host 0.0.0.0 so it binds to all interfaces.
           // For other Node frameworks, HOST=0.0.0.0 env var handles it.
@@ -745,6 +752,28 @@ app.get(
 
         void (async () => {
           try {
+            // Wait for the port to actually accept connections + return a
+            // body before probing. Flask + LDR can take 30-60s after the
+            // first "Starting..." log to bind. We retry up to ~60s.
+            const waitScript = [
+              "set -e",
+              'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do',
+              `  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 ${JSON.stringify(target)} 2>/dev/null || echo 000)`,
+              '  if [ "$code" != "000" ]; then echo READY; exit 0; fi',
+              "  sleep 5",
+              "done",
+              "echo TIMEOUT",
+            ].join("\n");
+            const wait = await sbx.commands.run(bashLc(waitScript));
+            const ready = /READY/.test(wait.stdout || "");
+            if (!ready) {
+              send("log", {
+                stream: "status",
+                line: `→ Preview diagnostics: ${target} did not respond within 60s; skipping probe.`,
+              });
+              return;
+            }
+
             send("log", {
               stream: "status",
               line: `→ Preview diagnostics: probing ${target}`,
@@ -961,10 +990,13 @@ app.get(
         }
       };
 
-      const sendPreview = (port: number, basePath?: string) => {
+      const sendPreview = (port: number, basePath?: string, opts?: { force?: boolean }) => {
         const url = buildPreviewUrl(port, basePath);
         if (!url) return;
-        sendPreviewUrl(url);
+        sendPreviewUrl(url, opts);
+        // Reset the diagnostics latch when we force a rebind so we re-probe
+        // the new port.
+        if (opts?.force) previewDiagnosed = false;
         runPreviewDiagnostics(port, basePath);
         void ensureHostRewriteProxy(port, basePath);
       };
@@ -973,13 +1005,35 @@ app.get(
         data: string,
       ) => {
         send("log", { stream, line: data });
-        if (previewUrl) return;
 
         const u = extractUrlFromLine(data);
         if (u) {
-          sendPreview(u.port, u.basePath);
+          // In hybrid mode, the Vite asset server may publish its URL first
+          // (5173) but the actual app lives on Flask/Django's port. If we've
+          // already locked preview but a new, non-Vite local URL appears,
+          // rebind to it.
+          if (!previewUrl) {
+            sendPreview(u.port, u.basePath);
+          } else if (hybridMode && u.port !== 5173) {
+            const currentPort = (() => {
+              try {
+                const m = previewUrl.match(/^https:\/\/(\d+)-/);
+                return m ? Number(m[1]) : null;
+              } catch {
+                return null;
+              }
+            })();
+            if (currentPort !== u.port) {
+              send("log", {
+                stream: "status",
+                line: `→ Hybrid: detected Python backend on :${u.port}; rebinding preview from :${currentPort ?? "?"}.`,
+              });
+              sendPreview(u.port, u.basePath, { force: true });
+            }
+          }
           return;
         }
+        if (previewUrl && !hybridMode) return;
         for (const rx of portRegexes) {
           const m = data.match(rx);
           if (m) {
@@ -1013,36 +1067,71 @@ app.get(
         onStderr: (data) => handleLine("stderr", data),
       });
 
-      // Fallback: if no port detected from logs after 30s, optimistically
-      // expose the most likely port for the detected stack. Some repos
-      // serve on non-standard ports (e.g. 5000), so probe a small set of
-      // common ports and pick the first open one.
+      // Fallback: if no port detected from logs after PREVIEW_FALLBACK_MS,
+      // optimistically expose the most likely port for the detected stack.
+      // In hybrid mode Flask boot can take 60-120s after npm install
+      // finishes, so we wait longer before guessing.
+      const fallbackDelay = hybridMode ? PREVIEW_FALLBACK_MS * 2 : PREVIEW_FALLBACK_MS;
       setTimeout(() => {
-        if (previewUrl || closed) return;
+        if (closed) return;
+        // In hybrid mode we may have already locked preview to Vite's :5173
+        // via the background command; we still want to upgrade to Flask if
+        // it's listening. So don't bail on previewUrl when hybrid.
+        if (previewUrl && !hybridMode) return;
         void (async () => {
-          const candidates = isVite
-            ? [5173, 3000, 5000, 8000, 8080]
-            : [3000, 5000, 5173, 8000, 8080];
+          // Order: in hybrid mode probe Flask/Django defaults first; in
+          // pure-Vite probe 5173 first; otherwise standard order.
+          const candidates = hybridMode
+            ? [5000, 8000, 3000, 8080, 5173]
+            : isVite
+              ? [5173, 3000, 5000, 8000, 8080]
+              : [3000, 5000, 5173, 8000, 8080];
+          // Content-aware probe: pick the first port that returns a non-empty
+          // body (not just an open TCP socket — Vite dev server keeps :5173
+          // open even when the actual app lives elsewhere).
           const script = [
             "set -e",
-            `for p in ${candidates.join(" ")}; do (echo > /dev/tcp/127.0.0.1/$p) >/dev/null 2>&1 && echo $p && exit 0; done; exit 1`,
-          ].join("; ");
+            'command -v curl >/dev/null 2>&1 || { echo NOCURL; exit 0; }',
+            `for p in ${candidates.join(" ")}; do`,
+            "  body=$(curl -fsS --max-time 4 \"http://127.0.0.1:$p/\" 2>/dev/null | head -c 32 || true)",
+            '  if [ -n "$body" ]; then echo $p; exit 0; fi',
+            "done",
+            // Second pass: any port that's at least open, even if body is empty.
+            `for p in ${candidates.join(" ")}; do`,
+            "  (echo > /dev/tcp/127.0.0.1/$p) >/dev/null 2>&1 && echo $p && exit 0",
+            "done",
+            "exit 1",
+          ].join("\n");
 
           try {
-            const r = await sbx.commands.run(`bash -lc ${JSON.stringify(script)}`);
-            const found = parseInt(r.stdout.trim(), 10);
+            const r = await sbx.commands.run(bashLc(script));
+            const found = parseInt((r.stdout || "").trim(), 10);
             if (!Number.isNaN(found)) {
-              sendPreview(found);
+              // If we already have a preview locked (hybrid), only swap when
+              // the discovered port is different.
+              if (previewUrl) {
+                const cur = previewUrl.match(/^https:\/\/(\d+)-/);
+                const curPort = cur ? Number(cur[1]) : null;
+                if (curPort === found) return;
+                send("log", {
+                  stream: "status",
+                  line: `→ Hybrid fallback: probed and selected :${found}; rebinding preview from :${curPort ?? "?"}.`,
+                });
+                sendPreview(found, undefined, { force: true });
+              } else {
+                sendPreview(found);
+              }
               return;
             }
           } catch {
             // ignore probe failures; fall back below
           }
 
-          const fallbackPort = isVite ? 5173 : 3000;
+          if (previewUrl) return;
+          const fallbackPort = hybridMode ? 5000 : isVite ? 5173 : 3000;
           sendPreview(fallbackPort);
         })();
-      }, PREVIEW_FALLBACK_MS);
+      }, fallbackDelay);
     } catch (err: any) {
       errorAndEnd(err?.message ?? "Unknown error during execution");
     }

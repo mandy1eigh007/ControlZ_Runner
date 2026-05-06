@@ -10,6 +10,29 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P0-FIX-2: hybrid Flask port rebind + smarter preview probe
+
+LDR (Flask + Vite hybrid) preview was locking onto port 3000 (or whatever
+the fallback timer found first) before Flask actually finished booting on
+its real port (often 5000). Diagnostics fired against an empty body and the
+iframe stayed blank.
+
+- New `hybridMode` flag set when the Python+Vite branch is taken.
+- `handleLine` now keeps watching for local URLs even after preview is set
+  in hybrid mode; if a non-Vite local port (e.g. `http://127.0.0.1:5000`)
+  appears later, the preview is force-rebound to that port.
+- `sendPreview` accepts `{ force }` and resets the diagnostics latch so the
+  new port is re-probed.
+- Fallback timer doubles (75s → 150s) in hybrid mode to give Flask time to
+  finish booting; fallback probe is now content-aware (curl-checks each
+  candidate for a non-empty body before picking) and probes Flask/Django
+  defaults `[5000, 8000, 3000, 8080, 5173]` first in hybrid mode.
+- Diagnostics now wait up to 60s (12 × 5s polls) for the target port to
+  return *any* HTTP status before probing — no more empty `--- body head ---`
+  output when the app is still starting.
+
+---
+
 ## 2026-05-06 — P0-FIX: auto-install required Python via uv
 
 LDR pyproject declares `requires-python = ">=3.12,<3.15"`, but the e2b sandbox
