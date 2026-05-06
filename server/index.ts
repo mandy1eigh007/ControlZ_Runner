@@ -1193,16 +1193,31 @@ app.get(
             // body before probing. Flask + LDR can take 30-60s after the
             // first "Starting..." log to bind. We retry up to ~60s.
             const waitScript = [
-              "set -e",
+              // Best-effort: diagnostics should never throw/abort on transient
+              // curl errors or ports mid-boot.
+              "set +e",
+              // If curl isn't available, just consider the port "ready" and
+              // let the probe script handle the rest.
+              "command -v curl >/dev/null 2>&1 || { echo READY; exit 0; }",
               'for i in 1 2 3 4 5 6 7 8 9 10 11 12; do',
-              `  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 ${JSON.stringify(target)} 2>/dev/null || echo 000)`,
+              `  code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 4 ${JSON.stringify(target)} 2>/dev/null || echo 000)`,
               '  if [ "$code" != "000" ]; then echo READY; exit 0; fi',
               "  sleep 5",
               "done",
               "echo TIMEOUT",
+              "exit 0",
             ].join("\n");
-            const wait = await sbx.commands.run(bashLc(waitScript));
-            const ready = /READY/.test(wait.stdout || "");
+            let wait: any;
+            try {
+              wait = await sbx.commands.run(bashLc(waitScript));
+            } catch (e: any) {
+              send("log", {
+                stream: "status",
+                line: `→ Preview diagnostics: wait step failed (${e?.message ?? e}); skipping probe.`,
+              });
+              return;
+            }
+            const ready = /READY/.test(wait?.stdout || "");
             if (!ready) {
               send("log", {
                 stream: "status",

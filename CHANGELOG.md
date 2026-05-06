@@ -41,6 +41,9 @@ hybrid poller continues to rebind to the backend as soon as it responds.
 Preview diagnostics are now best-effort (no hard failure) to avoid confusing
 `exit status 1` messages when a port is mid-boot or curl times out.
 
+This includes the initial “wait for port to respond” step, which now fails
+softly and logs `skipping probe` instead of surfacing an exception.
+
 ---
 
 ## 2026-05-06 — P2-12: quieter pip / npm install logs
