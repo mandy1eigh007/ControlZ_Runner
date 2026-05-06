@@ -586,6 +586,37 @@ app.get(
             pyMin,
           };
         }
+        // Django: manage.py is the universal entry point. runserver binds to
+        // 0.0.0.0:3000 so the e2b preview proxy can reach it.
+        if (await has("manage.py")) {
+          return {
+            install,
+            start: "python -u manage.py runserver 0.0.0.0:3000",
+            pyMin,
+          };
+        }
+        // ASGI app (FastAPI/Starlette/Django-ASGI). Convention: `asgi.py`
+        // exposes an `application` callable. Use `python -m uvicorn` so we
+        // don't depend on the `uvicorn` console script being on PATH.
+        if (await has("asgi.py")) {
+          return {
+            install,
+            start:
+              "python -m uvicorn asgi:application --host 0.0.0.0 --port 3000",
+            pyMin,
+          };
+        }
+        // WSGI app (classic Flask/Django). Convention: `wsgi.py` exposes an
+        // `application` callable. Use `python -m gunicorn` for the same
+        // PATH-independence reason as above.
+        if (await has("wsgi.py")) {
+          return {
+            install,
+            start:
+              "python -m gunicorn wsgi:application --bind 0.0.0.0:3000",
+            pyMin,
+          };
+        }
         if (await has("app.py")) return { install, start: "python -u app.py", pyMin };
         if (await has("main.py")) return { install, start: "python -u main.py", pyMin };
 

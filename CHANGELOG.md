@@ -10,6 +10,22 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P1-7: detect Django / ASGI / WSGI Python entry points
+
+`detectPythonStart()` now recognizes three additional conventional layouts
+between the streamlit check and the `app.py`/`main.py` fallbacks:
+
+- `manage.py` → `python -u manage.py runserver 0.0.0.0:3000` (Django)
+- `asgi.py` → `python -m uvicorn asgi:application --host 0.0.0.0 --port 3000`
+- `wsgi.py` → `python -m gunicorn wsgi:application --bind 0.0.0.0:3000`
+
+Both ASGI/WSGI launchers use `python -m` so we don't depend on the
+`uvicorn`/`gunicorn` console script being on PATH (which depends on whether
+the venv was activated correctly). Order matters: streamlit > Django >
+ASGI > WSGI > generic `app.py` > `main.py` > `[project.scripts]`.
+
+---
+
 ## 2026-05-06 — P1-6: pre-clone GitHub language detection
 
 Added `fetchRepoLanguages(owner, name)` that calls `GET /repos/:o/:r/languages`
