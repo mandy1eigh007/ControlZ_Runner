@@ -1015,6 +1015,10 @@ app.get(
       // PHASE 4 — run + port detection
       status("running");
       let previewUrl: string | null = null;
+      let primaryPreviewPort: number | null = null;
+
+      type PreviewOption = { port: number; url: string; label: string };
+      const previewOptions = new Map<number, PreviewOption>();
       const portRegexes = [
         /(?:listening|running|server started|ready|started server).{0,40}?(?:port|:)\s*(\d{2,5})/i,
         /Uvicorn running on https?:\/\/[^:]+:(\d{2,5})/i,
@@ -1038,6 +1042,40 @@ app.get(
         const host = sbx.getHost(port); // SYNC
         const path = normalizeBasePath(basePath);
         return `https://${host}${path}`;
+      };
+
+      const labelForPreviewPort = (port: number): string => {
+        if (getHybridMode()) {
+          return port === 5173 ? "Vite" : "Backend";
+        }
+        if (getIsVite() || port === 5173) return "Vite";
+        if (primaryStack === "python-pure") return "Python";
+        return "App";
+      };
+
+      const emitPreviews = () => {
+        if (closed) return;
+        const options = Array.from(previewOptions.values());
+        // Primary first, then by label, then by port.
+        options.sort((a, b) => {
+          const ap = a.port === primaryPreviewPort ? 0 : 1;
+          const bp = b.port === primaryPreviewPort ? 0 : 1;
+          if (ap !== bp) return ap - bp;
+          const lc = a.label.localeCompare(b.label);
+          if (lc !== 0) return lc;
+          return a.port - b.port;
+        });
+        send("previews", { options, primaryPort: primaryPreviewPort });
+      };
+
+      const registerPreviewOption = (port: number, basePath?: string, label?: string) => {
+        const url = buildPreviewUrl(port, basePath);
+        if (!url) return;
+        const next: PreviewOption = { port, url, label: label ?? labelForPreviewPort(port) };
+        const prev = previewOptions.get(port);
+        if (prev && prev.url === next.url && prev.label === next.label) return;
+        previewOptions.set(port, next);
+        emitPreviews();
       };
 
       let previewDiagnosed = false;
@@ -1134,7 +1172,7 @@ app.get(
                       stream: "status",
                       line: `→ Preview path fallback: ${safePath} returned 404; switching to ${pickedPath}`,
                     });
-                    sendPreviewUrl(fixedUrl, { force: true });
+                    sendPreviewUrl(fixedUrl, { force: true, port });
                   }
                 } else if (!pickedPath && getIsVite()) {
                   // Vite returned 404 on its base path AND no other path on
@@ -1165,9 +1203,15 @@ app.get(
         if (!opts?.force && previewUrl) return;
         if (previewUrl === url) return;
         previewUrl = url;
+        if (typeof opts?.port === "number") primaryPreviewPort = opts.port;
         // Include port (when known) so the UI can show "Vite · :5173" pill.
         send("preview", { url, port: opts?.port ?? null });
         send("log", { stream: "status", line: `→ Preview: ${url}` });
+        // Keep the multi-preview list in sync with whatever we selected as primary.
+        if (typeof opts?.port === "number") {
+          registerPreviewOption(opts.port);
+        }
+        emitPreviews();
       };
 
       const extractUrlFromLine = (line: string): { port: number; basePath: string } | null => {
@@ -1286,11 +1330,12 @@ app.get(
 
         const fixedUrl = buildPreviewUrl(listenPort, path);
         if (fixedUrl) {
-          sendPreviewUrl(fixedUrl, { force: true });
+          sendPreviewUrl(fixedUrl, { force: true, port: listenPort });
         }
       };
 
       const sendPreview = (port: number, basePath?: string, opts?: { force?: boolean }) => {
+        registerPreviewOption(port, basePath);
         const url = buildPreviewUrl(port, basePath);
         if (!url) return;
         sendPreviewUrl(url, { ...opts, port });
@@ -1308,6 +1353,9 @@ app.get(
 
         const u = extractUrlFromLine(data);
         if (u) {
+          // Record every discovered local URL as a preview option so the UI
+          // can offer tabs (especially useful for hybrid Python+Vite repos).
+          registerPreviewOption(u.port, u.basePath);
           // In hybrid mode, the Vite asset server may publish its URL first
           // (5173) but the actual app lives on Flask/Django's port. If we've
           // already locked preview but a new, non-Vite local URL appears,
@@ -1349,6 +1397,15 @@ app.get(
           stream: "status",
           line: `→ Injecting ${Object.keys(userEnvs).length} user env var(s): ${Object.keys(userEnvs).join(", ")}`,
         });
+      }
+
+      // In hybrid mode we always have at least two interesting ports:
+      // - Vite asset server (usually :5173)
+      // - Python backend (varies; discovered later via logs/poller)
+      // Register the Vite port up-front so the UI can render a tab even
+      // before the backend port is discovered.
+      if (getHybridMode()) {
+        registerPreviewOption(5173, "/", "Vite");
       }
 
       await sbx.commands.run(startCmd!, {

@@ -8,6 +8,8 @@ type Status =
 
 type Stack = "auto" | "node" | "python" | "hybrid-py-node" | "static" | "rust" | "go";
 
+type PreviewOption = { port: number; url: string; label: string };
+
 const STACK_OPTIONS: { value: Stack; label: string; hint: string }[] = [
   { value: "auto", label: "Auto", hint: "Detect from repo files" },
   { value: "node", label: "Node", hint: "package.json (Vite, Next, Express…)" },
@@ -43,9 +45,13 @@ export function App() {
   const [status, setStatus] = useState<Status>("idle");
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
   const [previewPort, setPreviewPort] = useState<number | null>(null);
+  const [primaryPreviewUrl, setPrimaryPreviewUrl] = useState<string | null>(null);
+  const [primaryPreviewPort, setPrimaryPreviewPort] = useState<number | null>(null);
+  const [previewOptions, setPreviewOptions] = useState<PreviewOption[]>([]);
   const [detectedStack, setDetectedStack] = useState<string | null>(null);
   const [activeSandbox, setActiveSandbox] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const manualPreviewRef = useRef(false);
   // Recent repos history (most-recent-first, deduped, capped). Persisted to
   // localStorage so it survives reloads. Used to power a native <datalist>
   // dropdown attached to the URL input — no extra UI surface, just type or
@@ -194,6 +200,10 @@ export function App() {
     setStatus("idle");
     setPreviewUrl(null);
     setPreviewPort(null);
+    setPrimaryPreviewUrl(null);
+    setPrimaryPreviewPort(null);
+    setPreviewOptions([]);
+    manualPreviewRef.current = false;
     setDetectedStack(null);
     terminalRef.current?.clear();
     try {
@@ -237,8 +247,55 @@ export function App() {
       es.addEventListener("preview", (e) => {
         const { url: u, port } = JSON.parse((e as MessageEvent).data) as
           { url: string; port?: number | null };
-        setPreviewUrl(u);
-        if (typeof port === "number") setPreviewPort(port);
+        setPrimaryPreviewUrl(u);
+        if (typeof port === "number") setPrimaryPreviewPort(port);
+
+        setPreviewOptions((prev) => {
+          if (typeof port !== "number") return prev;
+          const next: PreviewOption = { url: u, port, label: "Primary" };
+          const filtered = prev.filter((x) => x.port !== port);
+          return [next, ...filtered];
+        });
+
+        // Default behavior: follow the primary preview emitted by the server.
+        // If the user manually selected a non-primary tab, keep their choice.
+        setPreviewUrl((cur) => {
+          if (!cur) return u;
+          if (manualPreviewRef.current) return cur;
+          return u;
+        });
+        setPreviewPort((cur) => {
+          if (typeof port !== "number") return cur;
+          if (!cur) return port;
+          if (manualPreviewRef.current) return cur;
+          return port;
+        });
+      });
+      es.addEventListener("previews", (e) => {
+        const data = JSON.parse((e as MessageEvent).data) as
+          { options: PreviewOption[]; primaryPort?: number | null };
+        const opts = Array.isArray(data.options) ? data.options : [];
+        setPreviewOptions(opts);
+        if (typeof data.primaryPort === "number") setPrimaryPreviewPort(data.primaryPort);
+
+        // If we don't have any preview yet, pick the primary (if known) else first.
+        // If we're following primary (not manual), keep the iframe in sync.
+        setPreviewUrl((cur) => {
+          const primary = typeof data.primaryPort === "number"
+            ? opts.find((o) => o.port === data.primaryPort)
+            : null;
+          if (!cur) return (primary ?? opts[0])?.url ?? null;
+          if (!manualPreviewRef.current && primary) return primary.url;
+          return cur;
+        });
+        setPreviewPort((cur) => {
+          const primary = typeof data.primaryPort === "number"
+            ? opts.find((o) => o.port === data.primaryPort)
+            : null;
+          if (!cur) return (primary ?? opts[0])?.port ?? null;
+          if (!manualPreviewRef.current && primary) return primary.port;
+          return cur;
+        });
       });
       es.addEventListener("stack", (e) => {
         const { label } = JSON.parse((e as MessageEvent).data) as
@@ -280,6 +337,16 @@ export function App() {
   };
 
   const running = activeSandbox !== null;
+
+  const selectPreview = (opt: PreviewOption) => {
+    // If the user clicks the primary tab, resume auto-follow behavior.
+    const isPrimary =
+      (typeof primaryPreviewPort === "number" && opt.port === primaryPreviewPort) ||
+      (!!primaryPreviewUrl && opt.url === primaryPreviewUrl);
+    manualPreviewRef.current = !isPrimary;
+    setPreviewUrl(opt.url);
+    setPreviewPort(opt.port);
+  };
 
   return (
     <div className="flex h-full flex-col bg-neutral-950 text-emerald-200">
@@ -419,6 +486,32 @@ export function App() {
         <div className="relative bg-neutral-950">
           {previewUrl ? (
             <>
+              {previewOptions.length > 1 && (
+                <div className="absolute left-3 top-3 z-10 flex flex-wrap items-center gap-1.5">
+                  {previewOptions.map((opt) => {
+                    const active = previewPort != null ? opt.port === previewPort : opt.url === previewUrl;
+                    const isPrimary =
+                      (typeof primaryPreviewPort === "number" && opt.port === primaryPreviewPort) ||
+                      (!!primaryPreviewUrl && opt.url === primaryPreviewUrl);
+                    const label = isPrimary ? `${opt.label || "Preview"}*` : (opt.label || "Preview");
+                    return (
+                      <button
+                        key={opt.port}
+                        type="button"
+                        onClick={() => selectPreview(opt)}
+                        className={`rounded border px-2 py-1 text-[11px] font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/80 ${
+                          active
+                            ? "border-emerald-700/60 bg-emerald-900/90 text-emerald-50"
+                            : "border-emerald-900/60 bg-neutral-950/90 text-emerald-300 hover:border-emerald-700/60"
+                        }`}
+                        title={opt.url}
+                      >
+                        {label} :{opt.port}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
               <iframe src={previewUrl} className="h-full w-full border-0"
                 sandbox="allow-scripts allow-same-origin allow-forms allow-popups" />
               <a href={previewUrl} target="_blank" rel="noopener noreferrer"

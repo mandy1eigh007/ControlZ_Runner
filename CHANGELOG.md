@@ -10,6 +10,21 @@ _(planned — see todo list)_
 
 ---
 
+## 2026-05-06 — P2-11: multi-port preview tabs (hybrid)
+
+Hybrid repos (Python backend + Vite asset server) now surface multiple preview
+targets instead of forcing a single iframe URL.
+
+- Server emits a new typed `previews` SSE event: `{ options: [{port,url,label}], primaryPort }`.
+  Options are recorded from discovered local URLs and from the known hybrid
+  Vite port (:5173).
+- UI renders compact tabs above the iframe when multiple options are present.
+  By default it follows the server’s primary preview, but if you manually
+  click a non-primary tab it keeps your selection until you click the primary
+  tab again.
+
+---
+
 ## 2026-05-06 — P2-12: quieter pip / npm install logs
 
 Install commands now route stdout through a `quietPipLog()` filter that
