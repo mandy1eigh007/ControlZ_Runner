@@ -1217,14 +1217,16 @@ app.get(
             });
 
             const script = [
-              "set -e",
+              // Best-effort: never fail the whole diagnostics block just
+              // because curl times out or the port is mid-boot.
+              "set +e",
               "command -v curl >/dev/null 2>&1 || { echo 'curl not available'; exit 0; }",
               `echo '--- status+headers ---'`,
-              `curl -sS -L -D - -o /dev/null --max-time 5 ${JSON.stringify(target)} | sed -n '1,40p'`,
+              `curl -sS -L -D - -o /dev/null --max-time 5 ${JSON.stringify(target)} 2>&1 | sed -n '1,40p' || true`,
               `echo '--- key headers ---'`,
-              `curl -sS -L -D - -o /dev/null --max-time 5 ${JSON.stringify(target)} | awk 'BEGIN{IGNORECASE=1} /^(x-frame-options|content-security-policy|cross-origin-opener-policy|cross-origin-embedder-policy|cross-origin-resource-policy|x-content-type-options|location|content-type):/ {print}'`,
+              `curl -sS -L -D - -o /dev/null --max-time 5 ${JSON.stringify(target)} 2>&1 | awk 'BEGIN{IGNORECASE=1} /^(x-frame-options|content-security-policy|cross-origin-opener-policy|cross-origin-embedder-policy|cross-origin-resource-policy|x-content-type-options|location|content-type):/ {print}' || true`,
               `echo '--- body head (first 400 bytes) ---'`,
-              `curl -sS -L --max-time 5 ${JSON.stringify(target)} | head -c 400 | tr '\n' ' '`,
+              `curl -sS -L --max-time 5 ${JSON.stringify(target)} 2>&1 | head -c 400 | tr '\n' ' ' || true`,
               `echo`,
             ].join("\n");
 

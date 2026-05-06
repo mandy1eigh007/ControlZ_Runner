@@ -38,6 +38,9 @@ Hybrid runs now also seed the initial preview to Vite `:5173/static/` so the
 iframe isn’t blank while the Python backend is still booting; the existing
 hybrid poller continues to rebind to the backend as soon as it responds.
 
+Preview diagnostics are now best-effort (no hard failure) to avoid confusing
+`exit status 1` messages when a port is mid-boot or curl times out.
+
 ---
 
 ## 2026-05-06 — P2-12: quieter pip / npm install logs
