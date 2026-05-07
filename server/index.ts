@@ -2,6 +2,7 @@ import "dotenv/config";
 import express, { Request, Response } from "express";
 import cors from "cors";
 import { Sandbox } from "e2b";
+import Anthropic from "@anthropic-ai/sdk";
 
 const PORT = 8787;
 // Hard sandbox lifetime cap. Long enough to allow heavy Python installs
@@ -34,10 +35,13 @@ type Stack = "auto" | "node" | "python" | "static" | "rust" | "go" | "hybrid-py-
 const VALID_STACKS: Stack[] = ["auto", "node", "python", "static", "rust", "go", "hybrid-py-node"];
 type RunConfig = {
   url: string;
-  customCommand: string;
+  customCommand: string;   // user override for the START command
+  installCommand?: string; // user override for the INSTALL command
   stack: Stack;
   envs: Record<string, string>;
+  subdir?: string; // User-specified subdirectory (relative to repo root)
   githubLanguages?: Array<[string, number]> | null;
+  anthropicApiKey?: string; // User-supplied Claude API key for pre-flight analysis
 };
 const runConfigs = new Map<string, RunConfig>();
 
@@ -162,13 +166,131 @@ async function disposeSandbox(sandboxId: string) {
   runConfigs.delete(sandboxId);
 }
 
+app.post("/api/preflight", async (req: Request, res: Response) => {
+  try {
+    const { url, anthropicApiKey } = req.body as { url?: string; anthropicApiKey?: string };
+    if (!url || !isValidGitHubUrl(url)) {
+      return res.status(400).json({ error: "Invalid GitHub URL" });
+    }
+    if (!anthropicApiKey?.trim()) {
+      return res.status(400).json({ error: "No Anthropic API key" });
+    }
+    const normalized = normalizeUrl(url);
+    const parsed = parseOwnerRepo(normalized);
+    if (!parsed) return res.status(400).json({ error: "Could not parse repo" });
+    const { owner, name } = parsed;
+
+    // Fetch repo context using GitHub APIs — no sandbox required.
+    const ghHeaders: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "ControlZ-Runner",
+    };
+    const tok = process.env.GITHUB_TOKEN?.trim();
+    if (tok) ghHeaders.Authorization = `Bearer ${tok}`;
+
+    const rawFetch = async (path: string): Promise<string> => {
+      try {
+        const r = await fetch(
+          `https://raw.githubusercontent.com/${owner}/${name}/HEAD/${path}`,
+          { headers: { "User-Agent": "ControlZ-Runner" }, signal: AbortSignal.timeout(8_000) },
+        );
+        if (!r.ok) return "";
+        const text = await r.text();
+        return text.slice(0, 6000); // cap per file
+      } catch { return ""; }
+    };
+
+    const treeFetch = async (): Promise<string> => {
+      try {
+        const r = await fetch(
+          `https://api.github.com/repos/${owner}/${name}/git/trees/HEAD?recursive=1`,
+          { headers: ghHeaders, signal: AbortSignal.timeout(8_000) },
+        );
+        if (!r.ok) return "";
+        const data = await r.json() as { tree?: Array<{ path: string; type: string }> };
+        return (data.tree ?? [])
+          .filter((f) => f.type === "blob")
+          .map((f) => f.path)
+          .slice(0, 150)
+          .join("\n");
+      } catch { return ""; }
+    };
+
+    const [fileTree, readme, pkgJson, requirements, pyproject, cargoToml, goMod, envEx1, envEx2] =
+      await Promise.all([
+        treeFetch(),
+        rawFetch("README.md"),
+        rawFetch("package.json"),
+        rawFetch("requirements.txt"),
+        rawFetch("pyproject.toml"),
+        rawFetch("Cargo.toml"),
+        rawFetch("go.mod"),
+        rawFetch(".env.example"),
+        rawFetch(".env.template"),
+      ]);
+
+    const envExample = envEx1 || envEx2;
+
+    const contextParts: string[] = [
+      `## Repository\nhttps://github.com/${owner}/${name}`,
+      fileTree ? `## File tree\n\`\`\`\n${fileTree}\n\`\`\`` : "",
+      readme ? `## README.md\n${readme}` : "",
+      pkgJson ? `## package.json\n\`\`\`json\n${pkgJson}\n\`\`\`` : "",
+      requirements ? `## requirements.txt\n\`\`\`\n${requirements}\n\`\`\`` : "",
+      pyproject ? `## pyproject.toml\n\`\`\`\n${pyproject}\n\`\`\`` : "",
+      cargoToml ? `## Cargo.toml\n\`\`\`\n${cargoToml}\n\`\`\`` : "",
+      goMod ? `## go.mod\n\`\`\`\n${goMod}\n\`\`\`` : "",
+      envExample ? `## .env.example / .env.template\n\`\`\`\n${envExample}\n\`\`\`` : "",
+    ].filter(Boolean);
+
+    const systemPrompt = `You are a build pre-flight assistant for a tool that auto-clones and runs public GitHub repos in sandboxes.
+Analyse the repo context and respond with ONLY valid JSON matching this exact schema — no prose, no markdown fences:
+{
+  "summary": "1-2 sentence description of what the repo does",
+  "language": "primary language/framework (e.g. Next.js 14, FastAPI, Rust/Actix)",
+  "requiredEnvVars": [
+    { "key": "ENV_KEY", "description": "what it is and how to get it", "required": true }
+  ],
+  "optionalEnvVars": [
+    { "key": "ENV_KEY", "description": "what it does", "defaultValue": "value if blank is fine" }
+  ],
+  "externalServices": ["list of external services needed, e.g. PostgreSQL, Redis, Stripe"],
+  "warnings": ["any likely build/run issues, e.g. needs Node 20+, requires GPU, paid API only"],
+  "confidence": "high|medium|low"
+}
+Keep all values concise (under 120 chars each). If a field is empty use [].`;
+
+    const anthropic = new Anthropic({ apiKey: anthropicApiKey.trim() });
+    const msg = await anthropic.messages.create({
+      model: "claude-haiku-4-5",
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages: [{ role: "user", content: contextParts.join("\n\n") }],
+    });
+
+    const raw = ((msg.content[0] as { type: string; text: string })?.text ?? "").trim();
+    const jsonStr = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+    let preflight: Record<string, unknown> = {};
+    try { preflight = JSON.parse(jsonStr); } catch {
+      preflight = { summary: raw, confidence: "low" };
+    }
+    return res.json(preflight);
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message ?? "Preflight failed" });
+  }
+});
+
 app.post("/api/run", async (req: Request, res: Response) => {
   try {
-    const { url, customCommand, stack, envs } = req.body as {
+    const { url, customCommand, installCommand, stack, envs, subdir, anthropicApiKey } = req.body as {
       url?: string;
-      customCommand?: string;
+      customCommand?: string;   // start command override
+      installCommand?: string;  // install command override
       stack?: string;
       envs?: string;
+      subdir?: string;
+      anthropicApiKey?: string;
     };
     if (!url || !isValidGitHubUrl(url)) {
       return res.status(400).json({ error: "Invalid GitHub URL" });
@@ -194,8 +316,11 @@ app.post("/api/run", async (req: Request, res: Response) => {
     runConfigs.set(sbx.sandboxId, {
       url: normalizeUrl(url),
       customCommand: (customCommand ?? "").trim(),
+      installCommand: (installCommand ?? "").trim() || undefined,
       stack: stackChoice,
       envs: parsedEnvs,
+      subdir: typeof subdir === "string" ? subdir.trim() : undefined,
+      anthropicApiKey: typeof anthropicApiKey === "string" ? anthropicApiKey.trim() : undefined,
     });
 
     // Hard kill timer — fires after 10 min regardless of activity.
@@ -225,9 +350,12 @@ app.get(
       return;
     }
     const url = cfg.url;
-    const customCommand = cfg.customCommand;
+    const customCommand = cfg.customCommand;   // start command override
+    const installCommand = cfg.installCommand; // install command override
     const stackOverride: Stack = cfg.stack;
     const userEnvs: Record<string, string> = cfg.envs;
+    const subdir: string | undefined = cfg.subdir;
+    const anthropicApiKey: string | undefined = cfg.anthropicApiKey;
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache, no-transform");
@@ -486,17 +614,23 @@ app.get(
 
       // PHASE 2 — detect
       status("detecting");
+
+      // If subdir is set, all paths are relative to /home/user/repo/<subdir>
+      let repoRoot = "/home/user/repo" + (subdir ? "/" + subdir.replace(/^\/+|\/+$/g, "") : "");
+      let autoSubdir: string | null = null; // set if we auto-detect a subdirectory
+
       const has = async (p: string) => {
         const r = await sbx.commands.run(
-          `test -e /home/user/repo/${p} && echo yes || echo no`,
+          `test -e ${repoRoot}/${p} && echo yes || echo no`,
         );
         return r.stdout.trim() === "yes";
       };
 
+
       const repoHasAny = async (findExpr: string) => {
         const r = await sbx.commands.run(
           `sh -lc ${JSON.stringify(
-            `find /home/user/repo -maxdepth 4 -type f ${findExpr} -print -quit`,
+            `find ${repoRoot} -maxdepth 4 -type f ${findExpr} -print -quit`,
           )}`,
         );
         return r.stdout.trim().length > 0;
@@ -505,7 +639,7 @@ app.get(
       const looksDocsOnly = async () => {
         const hasDocs =
           (await has("README.md")) ||
-          (await repoHasAny("\\( -iname 'readme*' -o -name '*.md' \\)"));
+          (await repoHasAny("\\( -iname 'readme*' -o -name '*.md' \\"));
         if (!hasDocs) return false;
 
         const hasCode = await repoHasAny(
@@ -527,7 +661,7 @@ app.get(
               "-name '*.sh'",
               "-name '*.ps1'",
             ].join(" -o ") +
-            " \\)",
+            " \")",
         );
 
         return !hasCode;
@@ -756,12 +890,12 @@ app.get(
         let blob = "";
         try {
           if (await has("pyproject.toml")) {
-            blob += await sbx.files.read("/home/user/repo/pyproject.toml");
+            blob += await sbx.files.read(`${repoRoot}/pyproject.toml`);
           }
         } catch {}
         try {
           if (await has("requirements.txt")) {
-            blob += "\n" + await sbx.files.read("/home/user/repo/requirements.txt");
+            blob += "\n" + await sbx.files.read(`${repoRoot}/requirements.txt`);
           }
         } catch {}
         // Match `torch` as a top-level dep (not `torchvision`, `torchaudio`
@@ -809,7 +943,7 @@ app.get(
         let pyMin: string | null = null;
         if (await has("pyproject.toml")) {
           try {
-            const text = await sbx.files.read("/home/user/repo/pyproject.toml");
+            const text = await sbx.files.read(`${repoRoot}/pyproject.toml`);
             pyMin = parseRequiresPythonMin(text);
           } catch {
             // ignore — pyMin stays null
@@ -849,14 +983,50 @@ app.get(
         // PATH-independence reason as above.
         if (await has("wsgi.py")) {
           return {
-            install,
-            start:
-              "python -m gunicorn wsgi:application --bind 0.0.0.0:3000",
+            install: `${install} && pip_install --quiet gunicorn`,
+            start: "python -m gunicorn wsgi:application --bind 0.0.0.0:3000",
             pyMin,
           };
         }
-        if (await has("app.py")) return { install, start: "python -u app.py", pyMin };
-        if (await has("main.py")) return { install, start: "python -u main.py", pyMin };
+        // Framework-aware entrypoint detection.
+        // FastAPI apps only define an `app = FastAPI()` object — they MUST be
+        // started with uvicorn. Running `python -u main.py` exits immediately
+        // because no server is ever started. Flask apps without `app.run()`
+        // have the same silent-exit problem; use `flask run` for those.
+        const inferPyStartCmd = async (pyfile: string): Promise<{ start: string; extraInstall?: string }> => {
+          const mod = pyfile.replace(/\.py$/, "").replace(/\//g, ".");
+          let src = "";
+          try {
+            src = await sbx.files.read(`${repoRoot}/${pyfile}`);
+          } catch {}
+          // FastAPI → must use uvicorn (the app object never self-starts).
+          // Also ensure uvicorn is installed since many tutorial repos omit it.
+          if (/\bFastAPI\s*\(|from\s+fastapi\b/.test(src)) {
+            const varMatch = src.match(/^\s*(\w+)\s*=\s*FastAPI\s*\(/m);
+            const varName =
+              varMatch && /^[A-Za-z_]\w*$/.test(varMatch[1]) ? varMatch[1] : "app";
+            return {
+              start: `python -m uvicorn ${mod}:${varName} --host 0.0.0.0 --port 3000`,
+              extraInstall: "pip_install --quiet uvicorn[standard]",
+            };
+          }
+          // Flask with no app.run() → needs flask CLI
+          if (/\bFlask\s*\(|from\s+flask\b/.test(src) && !/\.run\s*\(/.test(src)) {
+            return { start: `FLASK_APP=${pyfile} python -m flask run --host 0.0.0.0 --port 3000` };
+          }
+          return { start: `python -u ${pyfile}` };
+        };
+
+        // Check root-level entry points first, then common src/ layout.
+        for (const pyfile of ["app.py", "main.py", "server.py", "run.py", "src/app.py", "src/main.py"]) {
+          if (await has(pyfile)) {
+            const { start, extraInstall } = await inferPyStartCmd(pyfile);
+            // Append any extra package installs (e.g. uvicorn) to the end of the
+            // install command so they're guaranteed to be present at runtime.
+            const finalInstall = extraInstall ? `${install} && ${extraInstall}` : install;
+            return { install: finalInstall, start, pyMin };
+          }
+        }
 
         if (await has("pyproject.toml")) {
           // Parse [project.scripts] inside the sandbox via Python (tomllib).
@@ -866,7 +1036,7 @@ app.get(
             "    import tomllib",
             "except ImportError:",
             "    import tomli as tomllib  # type: ignore",
-            "with open('/home/user/repo/pyproject.toml', 'rb') as f:",
+            `with open('${repoRoot}/pyproject.toml', 'rb') as f:`,
             "    d = tomllib.load(f)",
             "scripts = ((d.get('project') or {}).get('scripts')) or {}",
             "keys = list(scripts.keys())",
@@ -908,12 +1078,216 @@ app.get(
         });
       }
 
+      // Use GitHub language percentages to influence auto-detection order.
+      // When the repo has a clear dominant language, we hint the effective
+      // stack so the detection branches are tried in the most likely order.
+      // This avoids e.g. a 70% Python / 30% JS repo being mistakenly
+      // classified as Node just because it has a package.json at root.
+      const ghLangStack = (() => {
+        if (!githubLanguages || githubLanguages.length === 0) return null;
+        const total = githubLanguages.reduce((a, [, b]) => a + b, 0) || 1;
+        // Build a map of language -> percentage
+        const pct: Record<string, number> = {};
+        for (const [lang, bytes] of githubLanguages) {
+          pct[lang.toLowerCase()] = (bytes / total) * 100;
+        }
+        const py = (pct["python"] ?? 0);
+        const js = (pct["javascript"] ?? 0) + (pct["typescript"] ?? 0) + (pct["vue"] ?? 0) + (pct["svelte"] ?? 0);
+        const rust = pct["rust"] ?? 0;
+        const go = pct["go"] ?? 0;
+        // Only hint if dominant (>40%) and clearly ahead of the others.
+        if (py > 40 && py > js * 1.5) return "python";
+        if (js > 40 && js > py * 1.5) return "node";
+        if (rust > 40) return "rust";
+        if (go > 40) return "go";
+        // Hybrid hint: both Python and JS are significant
+        if (py > 15 && js > 15) return "hybrid";
+        return null;
+      })();
+
+      if (ghLangStack && stackOverride === "auto") {
+        send("log", {
+          stream: "status",
+          line: `→ GitHub languages suggest: ${ghLangStack} — using as detection hint`,
+        });
+      }
+
+      // Detection order. When GitHub language hints point at Python (or hybrid),
+      // try Python BEFORE Node so a repo with both package.json and requirements.txt
+      // isn't misclassified as Node. The normal order (Node first) is preserved
+      // when there's no strong language signal.
+      const pyFirst =
+        stackOverride === "python" ||
+        stackOverride === "hybrid-py-node" ||
+        (stackOverride === "auto" && (ghLangStack === "python" || ghLangStack === "hybrid"));
+
+      // ── Auto-subdir ─────────────────────────────────────────────────────────────────────
+      // If the user didn't set a subdirectory AND the repo root has no
+      // recognisable project files, scan one level deep. When all project
+      // files live in exactly one subdirectory, adopt it automatically so
+      // the user doesn't have to know the monorepo layout.
+      if (!subdir) {
+        const rootHasProject =
+          (await has("requirements.txt")) ||
+          (await has("package.json")) ||
+          (await has("pyproject.toml")) ||
+          (await has("Cargo.toml")) ||
+          (await has("go.mod")) ||
+          (await has("index.html"));
+        if (!rootHasProject) {
+          const scanResult = await sbx.commands.run(
+            bashLc(
+              `find ${repoRoot} -mindepth 2 -maxdepth 2 \\( -name requirements.txt -o -name package.json -o -name pyproject.toml -o -name Cargo.toml -o -name go.mod \\) 2>/dev/null | sort | head -20`,
+            ),
+          );
+          const foundPaths = (scanResult.stdout || "")
+            .trim()
+            .split("\n")
+            .filter(Boolean);
+          if (foundPaths.length > 0) {
+            const parentDirs = [
+              ...new Set(
+                foundPaths.map((f) => f.split("/").slice(0, -1).join("/")),
+              ),
+            ];
+            if (parentDirs.length === 1) {
+              // All project files are in one subdir — auto-pick it.
+              const newRoot = parentDirs[0];
+              const relSubdir = newRoot.replace(/^\/home\/user\/repo\/?/, "");
+              autoSubdir = relSubdir;
+              repoRoot = newRoot;
+              send("log", {
+                stream: "status",
+                line: `→ No project files at root; auto-detected subdirectory: "${relSubdir}" (set Advanced > Subdirectory to override)`,
+              });
+            } else {
+              const hint = foundPaths
+                .map((f) => "  " + f.replace("/home/user/repo/", ""))
+                .join("\n");
+              send("log", {
+                stream: "status",
+                line: `→ Multiple subdirectories with project files — pick one via Advanced > Subdirectory:\n${hint}`,
+              });
+            }
+          }
+        }
+      }
+
+      // ── .env.example scanning ────────────────────────────────────────────────
+      // Read common env template files and extract the key names so the UI can
+      // prompt the user to fill in values they haven't set yet.
+      {
+        const envTemplateFiles = [
+          ".env.example",
+          ".env.sample",
+          ".env.template",
+          ".env.local.example",
+          ".env.defaults",
+        ];
+        const parsedKeys: Array<{ key: string; defaultValue: string | null; comment: string | null }> = [];
+        for (const fname of envTemplateFiles) {
+          let content = "";
+          try { content = await sbx.files.read(`${repoRoot}/${fname}`); } catch { continue; }
+          if (!content.trim()) continue;
+          for (const raw of content.split("\n")) {
+            const line = raw.trim();
+            if (!line || line.startsWith("#")) continue;
+            // KEY=value  or  KEY=  or  KEY
+            const m = line.match(/^([A-Z_][A-Z0-9_]*)\s*(?:=(.*))?$/i);
+            if (!m) continue;
+            const key = m[1];
+            const val = m[2] !== undefined ? m[2].trim() : null;
+            // Skip if user already provided this key
+            const alreadySet = userEnvs[key] !== undefined;
+            if (alreadySet) continue;
+            // Don't duplicate keys across multiple template files
+            if (parsedKeys.some((e) => e.key === key)) continue;
+            parsedKeys.push({ key, defaultValue: val || null, comment: null });
+          }
+          if (parsedKeys.length > 0) {
+            send("log", {
+              stream: "status",
+              line: `→ Found ${fname} with ${parsedKeys.length} key(s) — check Required env vars panel above.`,
+            });
+            break; // use the first template file found
+          }
+        }
+        if (parsedKeys.length > 0) {
+          send("envkeys", parsedKeys);
+        }
+      }
+
+      // If a custom start command is set, use it — but still auto-detect the
+      // install step if the user didn't provide one. This handles the common
+      // case where someone sets a custom start command but expects the normal
+      // npm ci / pip install to happen automatically.
       if (customCommand) {
         startCmd = customCommand;
         setPrimaryStack("custom");
+        // Auto-detect install if user didn't override it.
+        if (!installCommand) {
+          if (await has("package.json")) {
+            const hasPackageLock = await has("package-lock.json");
+            const useYarn = !hasPackageLock && (await has("yarn.lock"));
+            const usePnpm = !hasPackageLock && !useYarn && ((await has("pnpm-lock.yaml")) || (await has("pnpm-lock.yml")));
+            installCmd = hasPackageLock
+              ? "npm ci --no-audit --no-fund --loglevel=error"
+              : useYarn
+                ? "yarn install --frozen-lockfile --non-interactive"
+                : usePnpm
+                  ? "pnpm install --frozen-lockfile"
+                  : "NODE_OPTIONS=--max-old-space-size=1024 npm install --no-audit --no-fund --loglevel=error";
+            installTimeoutMs = INSTALL_TIMEOUT_MS_NODE;
+          } else if ((await has("requirements.txt")) || (await has("pyproject.toml"))) {
+            installCmd = bashLc(PIP_SHIM_PREFIX + (await has("requirements.txt") ? "pip_install --quiet -r requirements.txt" : "pip_install --quiet ."));
+            installTimeoutMs = INSTALL_TIMEOUT_MS_PYTHON;
+          }
+        }
+      } else if (pyFirst && wantsStack("python", "hybrid-py-node") && ((await has("requirements.txt")) || (await has("pyproject.toml")))) {
+        // Python-first branch (triggered by GitHub language hint or explicit override)
+        // Falls through to the shared Python detection below — same logic, different order.
+        const py = await detectPythonStart();
+        if (!py) {
+          const hasReqs = await has("requirements.txt");
+          const installSuggestion = hasReqs
+            ? "pip install -r requirements.txt"
+            : "pip install .";
+          return errorAndEnd(
+            `${hasReqs ? "requirements.txt" : "pyproject.toml"} found but no Python entrypoint detected (no app.py / main.py / streamlit_app.py / manage.py / wsgi.py / asgi.py and no [project.scripts]).\n\nSuggested fix — open Advanced and set:\n  Install command: ${installSuggestion}\n  Start command:   python -m <your_module> (e.g. python -m uvicorn app.main:app --host 0.0.0.0 --port 8000)\n\nOr set Subdirectory to the folder containing your app.`,
+          );
+        }
+        // Also check for a Node side (hybrid) if the repo has both
+        if ((await has("package.json")) && wantsStack("hybrid-py-node", "node")) {
+          // Let it fall into the hybrid detection below by continuing
+          // with the Node branch — but mark Python as already detected.
+          // For simplicity, just run Python directly (pure Python wins here).
+        }
+        const pyPrefix = await ensurePythonEnvPrefix(py.pyMin);
+        const mlPrefix = await detectHeavyMlDeps();
+        const combined = (pyPrefix || "") + PIP_SHIM_PREFIX + (mlPrefix || "");
+        installCmd = bashLc(combined + py.install);
+        startCmd = pyPrefix ? bashLc(pyPrefix + py.start) : py.start;
+        installTimeoutMs = INSTALL_TIMEOUT_MS_PYTHON;
+        setPrimaryStack("python-pure");
       } else if (wantsStack("node", "hybrid-py-node") && (await has("package.json"))) {
-        installCmd = "npm install --no-audit --no-fund --loglevel=error";
-        const pkgText = await sbx.files.read("/home/user/repo/package.json");
+        // Pick the right package manager / install strategy based on what lockfiles ship with the repo.
+        // Priority:
+        //  1. package-lock.json → npm ci  (skips resolution, reads lockfile directly, ~10× less heap than npm install)
+        //  2. yarn.lock         → yarn install --frozen-lockfile  (lower heap than npm install)
+        //  3. pnpm-lock.yaml    → pnpm install --frozen-lockfile
+        //  4. fallback          → npm install with elevated heap cap
+        const hasPackageLock = await has("package-lock.json");
+        const useYarn = !hasPackageLock && (await has("yarn.lock"));
+        const usePnpm = !hasPackageLock && !useYarn && ((await has("pnpm-lock.yaml")) || (await has("pnpm-lock.yml")));
+        const pkgMgrInstall = hasPackageLock
+          ? "npm ci --no-audit --no-fund --loglevel=error"
+          : useYarn
+            ? "yarn install --frozen-lockfile --non-interactive"
+            : usePnpm
+              ? "pnpm install --frozen-lockfile"
+              : "NODE_OPTIONS=--max-old-space-size=1024 npm install --no-audit --no-fund --loglevel=error";
+        installCmd = pkgMgrInstall;
+        const pkgText = await sbx.files.read(`${repoRoot}/package.json`);
         let pkg: any = {};
         try {
           pkg = JSON.parse(pkgText);
@@ -957,7 +1331,7 @@ app.get(
             : null;
         if (forceHybrid && !hybridPy) {
           return errorAndEnd(
-            "Stack=hybrid-py-node but no Python entry found. Add app.py / main.py / streamlit_app.py at repo root, or define [project.scripts] in pyproject.toml, or use Advanced.",
+            "Stack=hybrid-py-node but no Python entry found.\n\nSuggested fix — open Advanced and set:\n  Start command: python -u app.py   (or python -m uvicorn app.main:app --host 0.0.0.0 --port 8000)\n\nOr add app.py / main.py / streamlit_app.py at the repo root, or define [project.scripts] in pyproject.toml.",
           );
         }
 
@@ -1003,10 +1377,10 @@ app.get(
 
           status("installing");
           const npmInstall = bashLc(
-            nodePrefix + "npm install --no-audit --no-fund --loglevel=error",
+            nodePrefix + pkgMgrInstall,
           );
           const ni = await sbx.commands.run(npmInstall, {
-            cwd: "/home/user/repo",
+            cwd: repoRoot,
             onStdout: quietPipLog("stdout"),
             onStderr: quietPipLog("stderr"),
             timeoutMs: INSTALL_TIMEOUT_MS_NODE,
@@ -1021,7 +1395,7 @@ app.get(
             (pyPrefix || "") + PIP_SHIM_PREFIX + (mlPrefix || "") + hybridPy.install,
           );
           const pi = await sbx.commands.run(pyInstall, {
-            cwd: "/home/user/repo",
+            cwd: repoRoot,
             onStdout: quietPipLog("stdout"),
             onStderr: quietPipLog("stderr"),
             timeoutMs: INSTALL_TIMEOUT_MS_PYTHON,
@@ -1040,7 +1414,7 @@ app.get(
             });
             const buildCmd = bashLc(nodePrefix + "npm run build --silent");
             const buildResult = await sbx.commands.run(buildCmd, {
-              cwd: "/home/user/repo",
+              cwd: repoRoot,
               onStdout: (d) =>
                 send("log", { stream: "stdout", line: `[build] ${d}` }),
               onStderr: (d) =>
@@ -1070,7 +1444,7 @@ app.get(
             );
             await sbx.commands.run(viteCmd, {
               background: true,
-              cwd: "/home/user/repo",
+              cwd: repoRoot,
               envs: {
                 HOST: "0.0.0.0",
                 __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: ".e2b.app",
@@ -1120,7 +1494,30 @@ app.get(
           } else if (scripts.serve) {
             startCmd = "npm run serve" + viteSuffix;
           } else {
-            return errorAndEnd("package.json has no dev/start/serve script");
+            // No standard npm script. Try framework CLI commands, then common
+            // entry files, before giving up.
+            if ("next" in allDeps) {
+              startCmd = "npx next dev -H 0.0.0.0 -p 3000";
+              send("log", { stream: "status", line: "→ No npm scripts; starting with: npx next dev" });
+            } else if ("nuxt" in allDeps || "@nuxt/core" in allDeps || "nuxt3" in allDeps || "@nuxt/kit" in allDeps) {
+              startCmd = "npx nuxt dev --host 0.0.0.0 --port 3000";
+              send("log", { stream: "status", line: "→ No npm scripts; starting with: npx nuxt dev" });
+            } else if ("gatsby" in allDeps) {
+              startCmd = "npx gatsby develop -H 0.0.0.0 -p 3000";
+              send("log", { stream: "status", line: "→ No npm scripts; starting with: npx gatsby develop" });
+            } else {
+              // Last resort: look for a common Node entry file.
+              let nodeEntry: string | null = null;
+              for (const f of ["index.js", "server.js", "src/index.js", "app.js", "src/server.js"]) {
+                if (await has(f)) { nodeEntry = f; break; }
+              }
+              if (nodeEntry) {
+                startCmd = `node ${nodeEntry}`;
+                send("log", { stream: "status", line: `→ No npm scripts; falling back to: node ${nodeEntry}` });
+              } else {
+                return errorAndEnd("package.json found but no dev/start/serve script detected.\n\nSuggested fix — open Advanced and set:\n  Install command: npm install\n  Start command:   node index.js   (or node server.js / node src/index.js)\n\nOr check the README for the correct start command.");
+              }
+            }
           }
 
           // Ensure both install + start run under the modern Node if we upgraded.
@@ -1133,10 +1530,12 @@ app.get(
       } else if (wantsStack("python") && ((await has("requirements.txt")) || (await has("pyproject.toml")))) {
         const py = await detectPythonStart();
         if (!py) {
+          const hasReqs = await has("requirements.txt");
+          const installSuggestion = hasReqs
+            ? "pip install -r requirements.txt"
+            : "pip install .";
           return errorAndEnd(
-            (await has("requirements.txt"))
-              ? "requirements.txt found but no app.py/main.py/streamlit_app.py and no [project.scripts] entry"
-              : "pyproject.toml found but no app.py/main.py/streamlit_app.py and no [project.scripts] entry",
+            `${hasReqs ? "requirements.txt" : "pyproject.toml"} found but no Python entrypoint detected (no app.py / main.py / streamlit_app.py / manage.py / wsgi.py / asgi.py and no [project.scripts]).\n\nSuggested fix — open Advanced and set:\n  Install command: ${installSuggestion}\n  Start command:   python -m <your_module> (e.g. python -m uvicorn app.main:app --host 0.0.0.0 --port 8000)\n\nOr set Subdirectory to the folder containing your app.`,
           );
         }
         const pyPrefix = await ensurePythonEnvPrefix(py.pyMin);
@@ -1147,7 +1546,53 @@ app.get(
         installTimeoutMs = INSTALL_TIMEOUT_MS_PYTHON;
         setPrimaryStack("python-pure");
       } else if (wantsStack("rust") && (await has("Cargo.toml"))) {
+        // Detect binary vs library crate — lib-only crates have no runnable target.
+        const hasMainRs = await has("src/main.rs");
+        const hasSrcBin = await has("src/bin");
+        if (!hasMainRs && !hasSrcBin) {
+          // Check for [[bin]] section in Cargo.toml before giving up.
+          let cargoTomlContent = "";
+          try { cargoTomlContent = await sbx.files.read(`${repoRoot}/Cargo.toml`); } catch {}
+          if (!/^\[\[bin\]\]/m.test(cargoTomlContent)) {
+            return errorAndEnd(
+              "Cargo.toml found but no src/main.rs or src/bin/ — this looks like a library crate with no runnable binary.\n\nIf the README describes how to run it, open Advanced and set the Start command manually (e.g. cargo run --example <name>).",
+            );
+          }
+        }
+        // Detect web framework from Cargo.toml dependencies.
+        let cargoToml = "";
+        try { cargoToml = await sbx.files.read(`${repoRoot}/Cargo.toml`); } catch {}
+        const hasActix = /actix-web/.test(cargoToml);
+        const hasRocket = /^rocket\s*[={\[]/m.test(cargoToml);
+        const hasAxum = /^axum\s*[={\[]/m.test(cargoToml);
+        const hasWarp = /^warp\s*[={\[]/m.test(cargoToml);
+        const hasTide = /^tide\s*[={\[]/m.test(cargoToml);
+        const hasPoem = /^poem\s*[={\[]/m.test(cargoToml);
+        const hasSalvo = /^salvo\s*[={\[]/m.test(cargoToml);
+        const detectedRustFramework = hasActix
+          ? "actix-web"
+          : hasRocket
+            ? "rocket"
+            : hasAxum
+              ? "axum"
+              : hasWarp
+                ? "warp"
+                : hasTide
+                  ? "tide"
+                  : hasPoem
+                    ? "poem"
+                    : hasSalvo
+                      ? "salvo"
+                      : null;
+        if (detectedRustFramework) {
+          send("log", { stream: "status", line: `→ Rust web framework detected: ${detectedRustFramework}` });
+        }
+        // Separate build from run so cargo's compilation phase has its own
+        // timeout. cargo build fills the build cache so that cargo run is
+        // very fast afterwards (no re-compile).
+        installCmd = "cargo build";
         startCmd = "cargo run";
+        installTimeoutMs = 12 * 60_000; // Rust cold compile can take 5-10 min
         setPrimaryStack("rust");
       } else if (wantsStack("go") && (await has("go.mod"))) {
         startCmd = "go run .";
@@ -1156,21 +1601,49 @@ app.get(
         startCmd = "python3 -m http.server 3000 --bind 0.0.0.0";
         setPrimaryStack("static");
       } else {
+        // Scan top-level dirs to help the user pick a subdirectory.
+        const subdirScan = await sbx.commands.run(
+          `find /home/user/repo -maxdepth 2 -name 'requirements.txt' -o -name 'package.json' -o -name 'pyproject.toml' -o -name 'Cargo.toml' -o -name 'go.mod' 2>/dev/null | head -20`,
+        );
+        const foundFiles = (subdirScan.stdout || "").trim();
+        const subdirHint = foundFiles
+          ? `\n\nProject files found inside the repo:\n${foundFiles.split("\n").map((f) => "  " + f.replace("/home/user/repo/", "")).join("\n")}\n\nTip: set the Subdirectory field to the folder containing your app (e.g. the folder that contains requirements.txt or package.json).`
+          : "";
+
         if (stackOverride !== "auto") {
           return errorAndEnd(
-            `Stack=${stackOverride} but no matching project files were found in the repo. Try Auto or Advanced with a custom command.`,
+            `Stack=${stackOverride} but no matching project files were found at ${subdir ? `"${subdir}"` : "the repo root"}.${subdirHint}`,
           );
         }
         if (await looksDocsOnly()) {
           startCmd = "python3 -m http.server 3000 --bind 0.0.0.0";
         } else {
           return errorAndEnd(
-            "Could not detect how to run this repo. Use Advanced to provide a custom start command.",
+            `Could not detect how to run this repo.${subdirHint}\n\nOr open Advanced and enter your own Install command and Start command.`,
           );
         }
       }
 
+      // Apply user install command override BEFORE logging "Will run" so they
+      // see the actual commands that will execute.
+      if (installCommand && !customCommand) {
+        // User provided a custom install command; use it instead of auto-detected.
+        installCmd = installCommand;
+        send("log", { stream: "status", line: `→ Install command override: ${installCommand}` });
+      }
+
+      // Emit detected/effective commands to the UI so the command preview panel
+      // can show them and allow editing before the next run.
+      send("commands", {
+        installCmd: installCmd ?? null,
+        startCmd: startCmd ?? null,
+        subdir: autoSubdir ?? subdir ?? null,
+      });
+
       send("log", { stream: "status", line: `→ Will run: ${startCmd}` });
+      if (installCmd) {
+        send("log", { stream: "status", line: `→ Install: ${installCmd}` });
+      }
 
       // PHASE 3 — install
       if (installCmd) {
@@ -1180,7 +1653,7 @@ app.get(
           line: `→ Install timeout: ${Math.round(installTimeoutMs / 60_000)}m`,
         });
         const ins = await sbx.commands.run(installCmd, {
-          cwd: "/home/user/repo",
+          cwd: repoRoot,
           onStdout: quietPipLog("stdout"),
           onStderr: quietPipLog("stderr"),
           timeoutMs: installTimeoutMs,
@@ -1201,6 +1674,18 @@ app.get(
         /(?:listening|running|server started|ready|started server).{0,40}?(?:port|:)\s*(\d{2,5})/i,
         /Uvicorn running on https?:\/\/[^:]+:(\d{2,5})/i,
         /You can now view .* in your browser.{0,80}?:(\d{2,5})/i,
+        // Flask dev server: " * Running on http://0.0.0.0:5000"
+        /\*\s+Running on https?:\/\/[^:]+:(\d{2,5})/i,
+        // Generic "http://...:<port>" announcement line
+        /https?:\/\/(?:0\.0\.0\.0|127\.0\.0\.1|localhost|\[::\]):(\d{2,5})/i,
+        // Rust: Rocket — "Rocket has launched from http://127.0.0.1:8000"
+        /Rocket has launched from https?:\/\/[^:]+:(\d{2,5})/i,
+        // Rust: Actix-web — "Started http server: 0.0.0.0:8080"
+        /Started\s+http\s+server.*?:(\d{2,5})/i,
+        // Rust: Tide/Poem/Salvo/Warp — "Server listening on http://..."
+        /Server\s+listening\s+on\s+https?:\/\/[^:]+:(\d{2,5})/i,
+        // Rust: Axum + tower-http tracing — "listening on 0.0.0.0:3000"
+        /listening\s+on\s+[^:\s]+:(\d{2,5})/i,
       ];
 
       const stripAnsi = (text: string) =>
@@ -1291,12 +1776,15 @@ app.get(
             ].join("\n");
             let wait: any;
             try {
-              wait = await sbx.commands.run(bashLc(waitScript));
+              wait = await sbx.commands.run(bashLc(waitScript), { timeoutMs: 75_000 });
             } catch (e: any) {
-              send("log", {
-                stream: "status",
-                line: `→ Preview diagnostics: wait step failed (${e?.message ?? e}); skipping probe.`,
-              });
+              // If we already have a preview URL the probe is moot — suppress the noise.
+              if (!previewUrl) {
+                send("log", {
+                  stream: "status",
+                  line: `→ Preview diagnostics: wait step failed (${e?.message ?? e}); skipping probe.`,
+                });
+              }
               return;
             }
             const ready = /READY/.test(wait?.stdout || "");
@@ -1358,7 +1846,7 @@ app.get(
                   ].join("\n");
 
                   try {
-                    const pick = await sbx.commands.run(bashLc(pickScript));
+                    const pick = await sbx.commands.run(bashLc(pickScript), { timeoutMs: 15_000 });
                     const pickedPath = stripAnsi(pick.stdout || "").trim();
                     if (pickedPath && pickedPath !== safePath) {
                       const fixedUrl = buildPreviewUrl(port, pickedPath);
@@ -1402,7 +1890,7 @@ app.get(
               `echo`,
             ].join("\n");
 
-            const out = await sbx.commands.run(bashLc(script));
+            const out = await sbx.commands.run(bashLc(script), { timeoutMs: 30_000 });
             const text = stripAnsi(out.stdout || "").trim();
             if (text) {
               for (const line of text.split(/\r?\n/)) {
@@ -1439,7 +1927,7 @@ app.get(
                 ].join("\n");
 
               try {
-                const pick = await sbx.commands.run(bashLc(pickScript));
+                const pick = await sbx.commands.run(bashLc(pickScript), { timeoutMs: 15_000 });
                 const pickedPath = stripAnsi(pick.stdout || "").trim();
                 if (pickedPath && pickedPath !== safePath) {
                   const fixedUrl = buildPreviewUrl(port, pickedPath);
@@ -1719,16 +2207,37 @@ app.get(
         });
       }
       const wrappedStart = `bash -lc 'chmod +x /tmp/cz-start.sh 2>/dev/null; t0=$SECONDS; /tmp/cz-start.sh; rc=$?; echo "[ControlZ] start command exited rc=$rc after $((SECONDS-t0))s" >&2; exit $rc'`;
+      const isPythonStack =
+        (primaryStack as PrimaryStack) === "python-pure" ||
+        (primaryStack as PrimaryStack) === "python-hybrid-vite";
+      const pythonMemVars: Record<string, string> = isPythonStack
+        ? {
+            OMP_NUM_THREADS: "1",
+            MKL_NUM_THREADS: "1",
+            LDR_WEB__MODEL: "small",
+          }
+        : {};
+      const isRustStack = (primaryStack as PrimaryStack) === "rust";
+      const rustEnvVars: Record<string, string> = isRustStack
+        ? {
+            RUST_LOG: "info",
+            RUST_BACKTRACE: "1",
+          }
+        : {};
       await sbx.commands.run(wrappedStart, {
         background: true,
-        cwd: "/home/user/repo",
+        cwd: repoRoot,
         envs: {
           HOST: "0.0.0.0",
+          HOSTNAME: "0.0.0.0",    // Next.js 14 reads HOSTNAME to set bind address
           PORT: "3000",
           BROWSER: "none",
           CI: "true",
+          NEXT_TELEMETRY_DISABLED: "1",
           __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: ".e2b.app",
           __VITE_ADDITIONAL_PREVIEW_ALLOWED_HOSTS: ".e2b.app",
+          ...pythonMemVars,
+          ...rustEnvVars,
           ...userEnvs,
         },
         onStdout: (data) => handleLine("stdout", data),
@@ -1743,14 +2252,14 @@ app.get(
       // in handleLine() and the one-shot fallback timer below.
       // Runs for any Python stack (pure or hybrid) since the loguru/no-log
       // pattern is common in both.
-      const isPythonStack =
-        (primaryStack as PrimaryStack) === "python-pure" ||
-        (primaryStack as PrimaryStack) === "python-hybrid-vite";
+      // (isPythonStack already declared above)
       if (isPythonStack) {
         // Wider port coverage: Flask defaults (5000/5001), Django (8000),
         // generic dev (3000/4000/8080), Gradio (7860), Streamlit (8501),
         // Jupyter (8888), and a few uncommon-but-real (5050).
-        const pyPorts = [5000, 5001, 5050, 8000, 8080, 3000, 4000, 7860, 8501, 8888];
+        // We inject PORT=3000 into the start env, so apps that respect $PORT
+        // bind there. Probe 3000 first, then common framework defaults.
+        const pyPorts = [3000, 5000, 5001, 5050, 8000, 8080, 4000, 7860, 8501, 8888];
         // Probe in parallel within the sandbox and print the first port
         // that returns a non-empty body. Also report ports that are at least
         // listening (TCP open) as a hint while we wait for a body.
@@ -1912,6 +2421,110 @@ app.get(
         setTimeout(() => void dumpDiagnostics("30s"), 30_000);
         setTimeout(() => void dumpDiagnostics("90s"), 90_000);
         setTimeout(() => void dumpDiagnostics("180s"), 180_000);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────
+      // Rust backend port poller — mirrors the Python poller above.
+      // Rust web frameworks bind to varying ports (Rocket: 8000, Actix: 8080,
+      // Axum/Warp/Tide: often 3000 or 3030). We inject PORT=3000 + RUST_LOG
+      // so frameworks that respect $PORT land on 3000; the poller picks up
+      // whichever port ends up open first.
+      // ─────────────────────────────────────────────────────────────────────
+      if (isRustStack) {
+        const rustPorts = [3000, 8080, 8000, 3030, 4000, 7878, 8088];
+        const rustPollScript = [
+          "set -e",
+          "command -v curl >/dev/null 2>&1 || exit 0",
+          "ext=$(hostname -I 2>/dev/null | awk '{print $1}')",
+          '[ -z "$ext" ] && ext=127.0.0.1',
+          `for p in ${rustPorts.join(" ")}; do`,
+          "  body=$(curl -fsS --max-time 2 \"http://$ext:$p/\" 2>/dev/null | head -c 32 || true)",
+          '  if [ -n "$body" ]; then echo "READY $p"; exit 0; fi',
+          "done",
+          `for p in ${rustPorts.join(" ")}; do`,
+          "  body=$(curl -fsS --max-time 2 \"http://127.0.0.1:$p/\" 2>/dev/null | head -c 32 || true)",
+          '  if [ -n "$body" ]; then echo "LOCAL_ONLY $p"; exit 0; fi',
+          "done",
+          "open=\"\"",
+          `for p in ${rustPorts.join(" ")}; do`,
+          "  (echo > /dev/tcp/127.0.0.1/$p) >/dev/null 2>&1 && open=\"$open $p\"",
+          "done",
+          'if [ -n "$open" ]; then echo "OPEN$open"; fi',
+          "exit 0",
+        ].join("\n");
+
+        const rustStart = Date.now();
+        const RUST_POLL_MAX_MS = 3 * 60_000;
+        const RUST_POLL_INTERVAL_MS = 5_000;
+        const RUST_HEARTBEAT_MS = 20_000;
+        let rustLastHeartbeat = 0;
+        let rustFirstTick = true;
+        send("log", {
+          stream: "status",
+          line: `→ Rust poller: watching ports [${rustPorts.join(",")}] (cargo run compiles then starts — first response may take a minute).`,
+        });
+        const rustTick = async () => {
+          if (closed) return;
+          const elapsed = Date.now() - rustStart;
+          if (elapsed > RUST_POLL_MAX_MS) {
+            send("log", {
+              stream: "status",
+              line: `→ Rust poller: gave up after ${Math.round(elapsed / 1000)}s. If your app binds to a non-standard port, add PORT=<n> under Advanced > Environment variables and re-run.`,
+            });
+            return;
+          }
+          try {
+            const r = await sbx.commands.run(bashLc(rustPollScript));
+            const out = (r.stdout || "").trim();
+            const readyMatch = out.match(/^READY\s+(\d+)/m);
+            if (readyMatch) {
+              const found = Number(readyMatch[1]);
+              const cur = previewUrl ? previewUrl.match(/^https:\/\/(\d+)-/) : null;
+              const curPort = cur ? Number(cur[1]) : null;
+              if (curPort !== found) {
+                send("log", {
+                  stream: "status",
+                  line: `→ Rust poller: server responding on :${found} after ${Math.round(elapsed / 1000)}s.`,
+                });
+                sendPreview(found, undefined, { force: true });
+              }
+              return;
+            }
+            const localMatch = out.match(/^LOCAL_ONLY\s+(\d+)/m);
+            if (localMatch) {
+              const lp = Number(localMatch[1]);
+              if (rustFirstTick || elapsed - rustLastHeartbeat >= RUST_HEARTBEAT_MS) {
+                rustFirstTick = false;
+                rustLastHeartbeat = elapsed;
+                send("log", {
+                  stream: "status",
+                  line: `→ Rust poller: server on 127.0.0.1:${lp} but NOT on the container's external IP — iframe cannot reach it. Add HOST=0.0.0.0 under Advanced > Environment variables (or pass --addr 0.0.0.0 in your start command) and re-run.`,
+                });
+              }
+              setTimeout(() => void rustTick(), RUST_POLL_INTERVAL_MS);
+              return;
+            }
+            if (rustFirstTick || elapsed - rustLastHeartbeat >= RUST_HEARTBEAT_MS) {
+              rustFirstTick = false;
+              rustLastHeartbeat = elapsed;
+              const openMatch = out.match(/^OPEN\s+(.+)$/m);
+              const openPorts = openMatch ? openMatch[1].trim().split(/\s+/).join(",") : "";
+              const detail = openPorts
+                ? `ports open but not responding: [${openPorts}]`
+                : `no ports open yet (still compiling?)`;
+              send("log", {
+                stream: "status",
+                line: `→ Rust poller: waiting (${Math.round(elapsed / 1000)}s elapsed; ${detail}).`,
+              });
+            }
+          } catch {
+            // ignore — retry on next tick
+          }
+          setTimeout(() => void rustTick(), RUST_POLL_INTERVAL_MS);
+        };
+        // Start probing after 15s — cargo run compiles before it binds.
+        // Even on a fast sandbox, the link step alone can take 10-20s.
+        setTimeout(() => void rustTick(), 15_000);
       }
 
       // Fallback: if no port detected from logs after PREVIEW_FALLBACK_MS,

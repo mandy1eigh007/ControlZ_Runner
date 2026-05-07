@@ -4,9 +4,30 @@ Running log of changes to RepoRunner. Newest first. Dates are session dates.
 
 ---
 
-## Unreleased
+## 2026-05-07 — Claude pre-flight moved to pre-build
 
-_(planned — see todo list)_
+Pre-flight analysis now runs **before** the sandbox is created, so users can
+fill in required env vars before clicking Run.
+
+**Changes — [server/index.ts](server/index.ts):**
+- New `POST /api/preflight` endpoint: fetches repo file tree + key files via
+  GitHub APIs (no sandbox), calls Claude Haiku, returns structured JSON
+  (`summary`, `language`, `requiredEnvVars`, `optionalEnvVars`,
+  `externalServices`, `warnings`, `confidence`).
+- Removed the in-stream preflight block that ran after clone (too late for
+  env-var entry).
+
+**Changes — [src/App.tsx](src/App.tsx):**
+- `preflightLoading` state added.
+- `useEffect` debounce (1.2 s) on `[url, anthropicKey]`: auto-calls
+  `/api/preflight` whenever a valid GitHub URL and Anthropic key are present —
+  no Run click needed.
+- Preflight panel now appears before the user starts the sandbox, with
+  per-key "Add" buttons for required env vars.
+- "Claude is analysing the repo…" spinner shown while the request is in
+  flight.
+- Removed the `es.addEventListener("preflight")` SSE listener (no longer
+  emitted by the backend).
 
 ---
 
